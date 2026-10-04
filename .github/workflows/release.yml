@@ -1,0 +1,31 @@
+name: release
+
+# Push a tag like v0.2.0 (matching Cargo.toml's version) to build and publish SimpleSTT.exe.
+# Running copies of SimpleSTT pick it up automatically on their next launch.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly (for build-std size optimisation)
+        run: rustup toolchain install nightly --profile minimal -c rust-src
+      - name: Tag must match Cargo.toml version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} != Cargo version v$v" }
+      - name: Build
+        shell: pwsh
+        run: ./build-release.ps1
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" dist/SimpleSTT.exe --title "${{ github.ref_name }}" --generate-notes

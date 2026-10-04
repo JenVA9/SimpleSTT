@@ -1,0 +1,8 @@
+[target.x86_64-pc-windows-msvc]
+# Static CRT: no VC++ redistributable needed for SimpleSTT.exe itself.
+# /OPT:REF,ICF,LBR = dead-strip unused code + fold identical functions.
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/OPT:REF,ICF,LBR",
+    "-C", "link-arg=/DEBUG:NONE",
+]

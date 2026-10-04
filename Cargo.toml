@@ -1,0 +1,47 @@
+[package]
+name = "simplestt"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny click-to-dictate speech-to-text tray-less widget powered by whisper.cpp"
+license = "MIT"
+repository = "https://github.com/JenVA9/SimpleSTT"
+
+[[bin]]
+name = "SimpleSTT"
+path = "src/main.rs"
+
+[dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
+    "Win32_Graphics_Dwm",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Size/speed-tuned release profile. The heavy lifting (inference) is native whisper.cpp
+# on the GPU; this binary is pure glue, so we optimise it for size.
+[profile.release]
+opt-level = "z"       # smallest code
+lto = "fat"           # whole-program dead-code elimination
+codegen-units = 1     # best inlining/DCE
+panic = "abort"       # no unwinding tables
+strip = true          # drop symbols
+incremental = false
+debug = false
