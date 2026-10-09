@@ -191,16 +191,21 @@ fn toggle_mic() {
 fn start_rec() {
     REC_STOP.store(false, Release);
     let (tx, rx) = mpsc::channel();
+    let desktop = cfg().desktop;
     let h = std::thread::spawn(move || {
-        audio::record(&REC_STOP, &|r| {
+        audio::record(&REC_STOP, desktop, &|r| {
             let _ = tx.send(r);
         })
     });
     match rx.recv() {
-        Ok(Ok(())) => {
+        Ok(Ok(with_desktop)) => {
             *REC_JOB.lock().unwrap() = Some(h);
             STATE.store(REC, Relaxed);
-            engine::set_status("Listening… click to finish", false);
+            match (desktop, with_desktop) {
+                (true, true) => engine::set_status("Listening to mic + desktop… click to finish", false),
+                (true, false) => engine::set_status("Desktop audio unavailable — mic only", true),
+                _ => engine::set_status("Listening… click to finish", false),
+            }
         }
         Ok(Err(e)) => {
             let _ = h.join();
@@ -465,6 +470,7 @@ const ID_BROWSE: i32 = 102;
 const ID_MODEL: i32 = 103;
 const ID_LANG: i32 = 104;
 const ID_DELETE: i32 = 107;
+const ID_DESKTOP: i32 = 108;
 
 unsafe fn open_settings(parent: HWND) {
     let existing = SETTINGS.load(Relaxed) as HWND;
@@ -491,7 +497,7 @@ unsafe fn open_settings(parent: HWND) {
         RegisterClassW(&wc);
     });
     let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    let mut r = RECT { left: 0, top: 0, right: s(460), bottom: s(300) };
+    let mut r = RECT { left: 0, top: 0, right: s(460), bottom: s(316) };
     AdjustWindowRectEx(&mut r, style, 0, 0);
     let (ww, wh) = (r.right - r.left, r.bottom - r.top);
     let mut pr: RECT = std::mem::zeroed();
@@ -604,10 +610,12 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             ctl(hwnd, "STATIC", "Language  (auto, en, de, fr, es, … — .en models always use English)", 0, 16, 134, 428, 18, 0);
             ctl(hwnd, "EDIT", &c.lang, EDIT, 16, 154, 120, 24, ID_LANG);
             let dd = format!("Engine, cache and settings live in:\n{}", util::data_dir().display());
-            ctl(hwnd, "STATIC", &dd, 0, 16, 196, 428, 36, 0);
-            ctl(hwnd, "BUTTON", "Delete all data…", BTN, 16, 252, 130, 30, ID_DELETE);
-            ctl(hwnd, "BUTTON", "Save", BTN | 1 /* BS_DEFPUSHBUTTON */, 274, 252, 80, 30, 1);
-            ctl(hwnd, "BUTTON", "Cancel", BTN, 364, 252, 80, 30, 2);
+            let cbx = ctl(hwnd, "BUTTON", "Also capture desktop audio (for calls — use headphones to avoid echo)", BTN | 3 /* BS_AUTOCHECKBOX */, 16, 192, 428, 22, ID_DESKTOP);
+            SendMessageW(cbx, BM_SETCHECK, c.desktop as usize, 0);
+            ctl(hwnd, "STATIC", &dd, 0, 16, 226, 428, 36, 0);
+            ctl(hwnd, "BUTTON", "Delete all data…", BTN, 16, 272, 130, 30, ID_DELETE);
+            ctl(hwnd, "BUTTON", "Save", BTN | 1 /* BS_DEFPUSHBUTTON */, 274, 272, 80, 30, 1);
+            ctl(hwnd, "BUTTON", "Cancel", BTN, 364, 272, 80, 30, 2);
             0
         }
         WM_COMMAND => {
@@ -636,11 +644,14 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         models_dir: if dir.trim().is_empty() { old.models_dir.clone() } else { PathBuf::from(dir.trim()) },
                         model: MODELS[i.min(MODELS.len() - 1)].0.to_string(),
                         lang: if lang.is_empty() { "auto".into() } else { lang },
+                        desktop: SendMessageW(GetDlgItem(hwnd, ID_DESKTOP), BM_GETCHECK, 0, 0) == 1,
                     };
                     if new != old {
                         new.save();
                         *CFG.lock().unwrap() = Some(new.clone());
-                        if STATE.load(Relaxed) == IDLE {
+                        // the desktop-audio toggle takes effect on the next recording; no engine restart
+                        if !new.engine_differs(&old) {
+                        } else if STATE.load(Relaxed) == IDLE {
                             engine::start_setup(new);
                         } else {
                             // mid-dictation: apply once the user is done

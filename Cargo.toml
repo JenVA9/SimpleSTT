@@ -1,6 +1,6 @@
 [package]
 name = "simplestt"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Tiny click-to-dictate speech-to-text tray-less widget powered by whisper.cpp"
 license = "MIT"
@@ -11,6 +11,7 @@ name = "SimpleSTT"
 path = "src/main.rs"
 
 [dependencies]
+windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Foundation"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

@@ -72,6 +72,15 @@ pub struct Config {
     pub models_dir: PathBuf,
     pub model: String,
     pub lang: String,
+    /// also capture what the PC is playing (calls, videos) and mix it with the mic
+    pub desktop: bool,
+}
+
+impl Config {
+    /// Settings that require restarting the whisper server when changed.
+    pub fn engine_differs(&self, o: &Config) -> bool {
+        self.models_dir != o.models_dir || self.model != o.model || self.lang != o.lang
+    }
 }
 
 impl Config {
@@ -84,6 +93,7 @@ impl Config {
             models_dir: util::data_dir().join("models"),
             model: "large-v3-turbo-q5_0".into(),
             lang: "auto".into(),
+            desktop: false,
         };
         if let Ok(t) = std::fs::read_to_string(Self::file()) {
             for l in t.lines() {
@@ -93,6 +103,7 @@ impl Config {
                         "models_dir" if !v.is_empty() => c.models_dir = PathBuf::from(v),
                         "model" if MODELS.iter().any(|m| m.0 == v) => c.model = v.into(),
                         "lang" if !v.is_empty() => c.lang = v.into(),
+                        "desktop" => c.desktop = v == "1",
                         _ => {}
                     }
                 }
@@ -104,10 +115,11 @@ impl Config {
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(util::data_dir());
         let t = format!(
-            "models_dir={}\nmodel={}\nlang={}\n",
+            "models_dir={}\nmodel={}\nlang={}\ndesktop={}\n",
             self.models_dir.display(),
             self.model,
-            self.lang
+            self.lang,
+            self.desktop as u8
         );
         let _ = std::fs::write(Self::file(), t);
     }
