@@ -367,6 +367,11 @@ pub fn cancel() {
     kill_server();
 }
 
+#[cfg(test)]
+pub fn test_set_port(p: u16) {
+    PORT.store(p, Relaxed);
+}
+
 // ---- transcription ----------------------------------------------------------------------------
 fn wav(samples: &[i16]) -> Vec<u8> {
     let data = (samples.len() * 2) as u32;

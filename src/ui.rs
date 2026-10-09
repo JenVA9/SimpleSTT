@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering::*};
 use std::sync::{Mutex, Once, OnceLock, mpsc};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ use std::result::Result::{Err, Ok}; // GDI+ also exports an `Ok` status constant
 
 use crate::engine::{self, Config, DONE, IDLE, MODELS, REC, STATE, TRANS};
 use crate::util::{self, WM_REFRESH, WM_RESULT, from_wide, w};
+use crate::live::{self, Live};
 use crate::{audio, update};
 
 // ---- layout (96-dpi units) ---------------------------------------------------------------------
@@ -61,7 +63,8 @@ static T0: OnceLock<Instant> = OnceLock::new();
 static RESULT: Mutex<Option<String>> = Mutex::new(None);
 static CFG: Mutex<Option<Config>> = Mutex::new(None);
 static REC_STOP: AtomicBool = AtomicBool::new(false);
-static REC_JOB: Mutex<Option<JoinHandle<Vec<i16>>>> = Mutex::new(None);
+type RecJob = (JoinHandle<()>, JoinHandle<Result<String, String>>);
+static REC_JOB: Mutex<Option<RecJob>> = Mutex::new(None);
 
 fn s(x: i32) -> i32 {
     x * DPI.load(Relaxed) as i32 / 96
@@ -188,27 +191,61 @@ fn toggle_mic() {
     }
 }
 
+fn live_file() -> PathBuf {
+    util::data_dir().join("live-transcript.txt")
+}
+
+/// Waits for the engine (recording may start before it's ready), then transcribes one chunk.
+fn transcribe_chunk(a: &[i16]) -> Result<String, String> {
+    let mut announced = false;
+    while !engine::READY.load(Relaxed) {
+        if engine::FAILED.load(Relaxed) {
+            return Err(engine::status());
+        }
+        if !announced && STATE.load(Relaxed) == TRANS {
+            announced = true;
+            engine::set_status("Waiting for model…", false);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    engine::transcribe(a)
+}
+
 fn start_rec() {
     REC_STOP.store(false, Release);
     let (tx, rx) = mpsc::channel();
     let desktop = cfg().desktop;
-    let h = std::thread::spawn(move || {
-        audio::record(&REC_STOP, desktop, &|r| {
+    let lv = Arc::new(Live::default());
+    let l1 = lv.clone();
+    let rec = std::thread::spawn(move || {
+        audio::record(&REC_STOP, desktop, &l1, &|r| {
             let _ = tx.send(r);
         })
     });
     match rx.recv() {
         Ok(Ok(with_desktop)) => {
-            *REC_JOB.lock().unwrap() = Some(h);
+            let (label, bad) = match (desktop, with_desktop) {
+                (true, true) => ("Listening to mic + desktop", false),
+                (true, false) => ("Desktop audio unavailable — mic only", true),
+                _ => ("Listening", false),
+            };
+            // Live transcription: each finished phrase is transcribed while recording continues and
+            // appended to a temp file; stopping only has to handle the last phrase.
+            let _ = std::fs::write(live_file(), "");
+            let chunker = std::thread::spawn(move || {
+                live::run(&lv, &REC_STOP, label, bad, &transcribe_chunk, &|t| {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(live_file()) {
+                        let _ = writeln!(f, "{t}");
+                    }
+                })
+            });
+            *REC_JOB.lock().unwrap() = Some((rec, chunker));
             STATE.store(REC, Relaxed);
-            match (desktop, with_desktop) {
-                (true, true) => engine::set_status("Listening to mic + desktop… click to finish", false),
-                (true, false) => engine::set_status("Desktop audio unavailable — mic only", true),
-                _ => engine::set_status("Listening… click to finish", false),
-            }
+            engine::set_status(&format!("{label}… click to finish"), bad);
         }
         Ok(Err(e)) => {
-            let _ = h.join();
+            let _ = rec.join();
             idle(&e, true);
         }
         Err(_) => idle("Couldn't open the microphone", true),
@@ -221,34 +258,27 @@ fn stop_rec() {
     engine::set_status("Transcribing…", false);
     let job = REC_JOB.lock().unwrap().take();
     std::thread::spawn(move || {
-        let samples = job.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-        finish(samples);
+        let res = match job {
+            Some((rec, chunker)) => {
+                let _ = rec.join();
+                chunker.join().unwrap_or_else(|_| Err("transcription crashed".into()))
+            }
+            None => Ok(String::new()),
+        };
+        finish(res);
     });
 }
 
-fn finish(samples: Vec<i16>) {
-    if samples.len() < 4800 {
-        return idle("Too short — try again", true);
-    }
-    let mut announced = false;
-    while !engine::READY.load(Relaxed) {
-        if engine::FAILED.load(Relaxed) {
-            STATE.store(IDLE, Relaxed);
-            util::refresh();
-            return; // setup error text is already on screen
-        }
-        if !announced {
-            announced = true;
-            engine::set_status("Waiting for model…", false);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    match engine::transcribe(&samples) {
+fn finish(res: Result<String, String>) {
+    match res {
         Ok(t) if !t.is_empty() => {
             *RESULT.lock().unwrap() = Some(t);
             unsafe { PostMessageW(util::main_hwnd(), WM_RESULT, 0, 0) };
         }
-        Ok(_) => idle("Didn't catch anything", true),
+        Ok(_) => {
+            let _ = std::fs::remove_file(live_file());
+            idle("Didn't catch anything", true)
+        }
         Err(e) if e == "engine not running" => {
             STATE.store(IDLE, Relaxed);
             engine::set_status("Engine stopped — restarting…", true);
@@ -443,6 +473,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_RESULT => {
             if let Some(t) = RESULT.lock().unwrap().take() {
                 if util::set_clipboard(hwnd, &t) {
+                    let _ = std::fs::remove_file(live_file()); // temp transcript no longer needed
                     STATE.store(DONE, Relaxed);
                     engine::set_status("Copied to clipboard", false);
                 } else {

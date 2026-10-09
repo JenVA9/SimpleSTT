@@ -16,6 +16,12 @@ A tiny (~300 KB) Windows speech-to-text widget. Click the mic, talk, click again
 
 Space also toggles recording while the window is focused.
 
+## Live transcription (long recordings finish instantly)
+
+While you record, SimpleSTT quietly transcribes each finished phrase in the background (it detects pauses, ~0.7 s of quiet) and appends the text to a temp file, `%LOCALAPPDATA%\SimpleSTT\live-transcript.txt`. Nothing is shown or pasted live. When you press stop only the last unsent phrase is left, so the text hits your clipboard in well under a second whether you recorded 10 seconds or an hour (the temp file is deleted once it's copied). While recording the status shows a running timer. Continuous sound with no pauses is cut at the quietest spot before 20 s.
+
+Measured on an RTX 5080 with `medium.en`, 153 s of speech: stop-to-clipboard **4.3 s before → 0.07 s now**, same accuracy (see the `--ignored` tests in `src/live.rs` for the offline harness).
+
 ## Capturing calls (desktop audio)
 
 Settings → **Also capture desktop audio**. While recording, SimpleSTT then mixes whatever your PC is playing (WASAPI loopback of the default output device — the other side of a call, a video, a stream) with your microphone, so one click transcribes both sides. It takes effect on the next recording (no engine restart), and the status line shows "Listening to mic + desktop…". Use headphones in calls, otherwise your mic re-captures the speakers and you get echo. If the output device can't be captured it falls back to mic-only and says so.
@@ -35,7 +41,7 @@ SimpleSTT is only glue (UI, mic capture, clipboard, downloads); inference is nat
 - Raw Win32 + GDI+ via `windows-sys` — no UI framework, no HTTP/TLS/JSON crates (WinHTTP, `BCrypt`, `waveIn` and the clipboard come from the OS)
 - `opt-level="z"`, fat LTO, `codegen-units=1`, `panic="abort"`, `strip`
 - Static CRT (no VC++ redistributable), linker `/OPT:REF,ICF`
-- Release builds use nightly `build-std` with `optimize_for_size`, `-Zlocation-detail=none`, `-Zfmt-debug=none` (~446 KB → ~305 KB)
+- Release builds use nightly `build-std` with `optimize_for_size`, `-Zlocation-detail=none`, `-Zfmt-debug=none` (~450 KB → ~310 KB)
 - Desktop audio is a hand-rolled WASAPI loopback (downmix + decimate to 16 kHz, placed on a wall-clock timeline so silent gaps stay aligned with the mic)
 - Mic is captured directly as 16 kHz mono PCM (Windows does the resampling); the Whisper server keeps the model loaded and the GPU warm
 

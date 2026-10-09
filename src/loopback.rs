@@ -7,12 +7,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::*;
+use crate::live::Timeline;
 use windows::Win32::System::Com::*;
 
 const OUT_RATE: f64 = 16000.0;
 
 /// Runs until `stop` is set. `opened` is signalled exactly once, after the stream starts (or fails).
-pub fn run(stop: &AtomicBool, t0: Instant, out: &Mutex<Vec<i16>>, opened: &dyn Fn(Result<(), String>)) {
+pub fn run(stop: &AtomicBool, t0: Instant, out: &Mutex<Timeline>, opened: &dyn Fn(Result<(), String>)) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         match capture(stop, t0, out, opened) {
@@ -26,7 +27,7 @@ pub fn run(stop: &AtomicBool, t0: Instant, out: &Mutex<Vec<i16>>, opened: &dyn F
 unsafe fn capture(
     stop: &AtomicBool,
     t0: Instant,
-    out: &Mutex<Vec<i16>>,
+    out: &Mutex<Timeline>,
     opened: &dyn Fn(Result<(), String>),
 ) -> windows::core::Result<()> {
     let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
@@ -94,12 +95,7 @@ unsafe fn capture(
             if !chunk.is_empty() {
                 // Place the chunk so it ends "now"; gaps while nothing plays become silence.
                 let now = (t0.elapsed().as_secs_f64() * OUT_RATE) as usize;
-                let mut v = out.lock().unwrap();
-                let start = now.saturating_sub(chunk.len());
-                if v.len() < start {
-                    v.resize(start, 0);
-                }
-                v.extend_from_slice(&chunk);
+                out.lock().unwrap().place(now.saturating_sub(chunk.len()), &chunk);
             }
         }
     }

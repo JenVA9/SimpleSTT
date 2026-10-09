@@ -1,13 +1,16 @@
-//! Microphone capture (plus optional desktop-audio loopback mixed in) with the classic waveIn API: Windows resamples/mixes to exactly what
-//! Whisper wants (16 kHz, mono, 16-bit) for us, so there is no DSP code here at all.
+//! Microphone capture with the classic waveIn API: Windows resamples/mixes to exactly what Whisper
+//! wants (16 kHz, mono, 16-bit) for us, so there is no DSP code here. Samples stream into `Live`
+//! (together with optional desktop-audio loopback) so they can be transcribed while still recording.
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Media::Audio::*;
-use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+use crate::live::Live;
 
 const NBUF: usize = 6;
 const BUF_BYTES: usize = 3200; // 100 ms
@@ -26,8 +29,7 @@ fn fmt() -> WAVEFORMATEX {
 
 /// Blocks until `stop` is set. `opened` is signalled once the mic is open (or failed); `Ok(true)` means
 /// desktop audio is being captured too. If desktop capture was requested but can't start, we go mic-only.
-pub fn record(stop: &AtomicBool, desktop: bool, opened: &dyn Fn(Result<bool, String>)) -> Vec<i16> {
-    let mut samples: Vec<i16> = Vec::with_capacity(16000 * 30);
+pub fn record(stop: &AtomicBool, desktop: bool, live: &Live, opened: &dyn Fn(Result<bool, String>)) {
     unsafe {
         let ev = CreateEventW(null_mut(), 0, 0, null_mut());
         let mut dev: HWAVEIN = null_mut();
@@ -36,7 +38,7 @@ pub fn record(stop: &AtomicBool, desktop: bool, opened: &dyn Fn(Result<bool, Str
         if r != 0 {
             CloseHandle(ev);
             opened(Err("Couldn't open the microphone".into()));
-            return samples;
+            return;
         }
         let t0 = Instant::now();
         let mut bufs: Vec<Vec<u8>> = (0..NBUF).map(|_| vec![0u8; BUF_BYTES]).collect();
@@ -50,71 +52,57 @@ pub fn record(stop: &AtomicBool, desktop: bool, opened: &dyn Fn(Result<bool, Str
         }
         waveInStart(dev);
 
-        // Desktop loopback runs on its own thread; its samples land on the same 16 kHz timeline.
-        let desk: Mutex<Vec<i16>> = Mutex::new(Vec::new());
-        let mut desk_ok = false;
+        // Desktop loopback runs on its own thread, placing samples on the same 16 kHz timeline.
         std::thread::scope(|sc| {
+            let mut desk_ok = false;
             if desktop {
                 let (tx, rx) = mpsc::channel();
-                let (stop, desk) = (stop, &desk);
-                sc.spawn(move || crate::loopback::run(stop, t0, desk, &|r| {
-                    let _ = tx.send(r);
-                }));
+                let desk = &live.desk;
+                sc.spawn(move || {
+                    crate::loopback::run(stop, t0, desk, &|r| {
+                        let _ = tx.send(r);
+                    })
+                });
                 desk_ok = matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(())));
             }
             opened(Ok(desk_ok));
-            record_loop(stop, ev, dev, &mut hdrs, &mut samples);
+            record_loop(stop, ev, dev, &mut hdrs, live);
         });
-        if desk_ok {
-            let d = desk.into_inner().unwrap_or_default();
-            if samples.len() < d.len() {
-                samples.resize(d.len(), 0);
-            }
-            for (m, x) in samples.iter_mut().zip(d) {
-                *m = m.saturating_add(x);
-            }
-        }
         for i in 0..NBUF {
             waveInUnprepareHeader(dev, &mut hdrs[i], hs);
         }
         waveInClose(dev);
         CloseHandle(ev);
     }
-    samples
+    live.mic_done.store(true, Ordering::Release);
 }
 
-unsafe fn record_loop(
-    stop: &AtomicBool,
-    ev: windows_sys::Win32::Foundation::HANDLE,
-    dev: HWAVEIN,
-    hdrs: &mut Box<[WAVEHDR; NBUF]>,
-    samples: &mut Vec<i16>,
-) {
+unsafe fn record_loop(stop: &AtomicBool, ev: HANDLE, dev: HWAVEIN, hdrs: &mut Box<[WAVEHDR; NBUF]>, live: &Live) {
     let hs = std::mem::size_of::<WAVEHDR>() as u32;
-    {
-
-        let drain = |hdrs: &mut [WAVEHDR; NBUF], samples: &mut Vec<i16>, requeue: bool| {
-            for i in 0..NBUF {
-                // WAVEHDR is #pragma pack(1): read the driver-updated flags without a reference.
-                if std::ptr::addr_of!(hdrs[i].dwFlags).read_unaligned() & WHDR_DONE != 0 {
-                    let n = hdrs[i].dwBytesRecorded as usize;
-                    let data = std::slice::from_raw_parts(hdrs[i].lpData, n);
-                    samples.extend(data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
-                    hdrs[i].dwFlags &= !WHDR_DONE;
-                    hdrs[i].dwBytesRecorded = 0;
-                    if requeue {
-                        waveInAddBuffer(dev, &mut hdrs[i], hs);
-                    }
+    let drain = |hdrs: &mut [WAVEHDR; NBUF], requeue: bool| {
+        let mut got: Vec<i16> = Vec::new();
+        for i in 0..NBUF {
+            // WAVEHDR is #pragma pack(1): read the driver-updated flags without a reference.
+            if std::ptr::addr_of!(hdrs[i].dwFlags).read_unaligned() & WHDR_DONE != 0 {
+                let n = hdrs[i].dwBytesRecorded as usize;
+                let data = std::slice::from_raw_parts(hdrs[i].lpData, n);
+                got.extend(data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+                hdrs[i].dwFlags &= !WHDR_DONE;
+                hdrs[i].dwBytesRecorded = 0;
+                if requeue {
+                    waveInAddBuffer(dev, &mut hdrs[i], hs);
                 }
             }
-        };
-
-        while !stop.load(Ordering::Acquire) {
-            WaitForSingleObject(ev, 50);
-            drain(hdrs, samples, true);
         }
-        waveInStop(dev);
-        waveInReset(dev); // returns any partially filled buffers as DONE
-        drain(hdrs, samples, false);
+        if !got.is_empty() {
+            live.mic.lock().unwrap().push(&got);
+        }
+    };
+    while !stop.load(Ordering::Acquire) {
+        WaitForSingleObject(ev, 50);
+        drain(hdrs, true);
     }
+    waveInStop(dev);
+    waveInReset(dev); // returns any partially filled buffers as DONE
+    drain(hdrs, false);
 }

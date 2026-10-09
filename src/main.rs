@@ -2,6 +2,7 @@
 
 mod audio;
 mod engine;
+mod live;
 mod loopback;
 mod net;
 mod ui;
