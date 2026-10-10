@@ -3,7 +3,8 @@
 A tiny (~300 KB) Windows speech-to-text widget. Click the mic, talk, click again — the text is on your clipboard.
 
 - **Mic button**: grey = idle · red (pulsing) = listening · amber = transcribing · **green = done, copied to clipboard**
-- **Gear button**: choose where models are stored, pick the Whisper model, set the language, turn on **desktop audio capture**, or **delete everything**
+- **Speaker button** (top-left): toggle **desktop audio capture** for calls (muted speaker = mic only, lit speaker = mic + PC sound)
+- **Gear button**: choose where models are stored, pick the Whisper model, set the language, or **delete everything**
 - Runs [whisper.cpp](https://github.com/ggml-org/whisper.cpp) on your NVIDIA GPU (CUDA) with the model kept resident in VRAM, so dictation takes a fraction of a second. Falls back to CPU automatically on machines without an NVIDIA GPU.
 - **No admin rights, no installer.** Download `SimpleSTT.exe`, run it. Everything it installs lives in `%LOCALAPPDATA%\SimpleSTT` (engine, models, CUDA cache, settings) unless you point the models folder elsewhere.
 - **Self-updating**: on launch it checks this repo's latest release, verifies the SHA-256, swaps itself and restarts.
@@ -24,7 +25,7 @@ Measured on an RTX 5080 with `medium.en`, 153 s of speech: stop-to-clipboard **4
 
 ## Capturing calls (desktop audio)
 
-Settings → **Also capture desktop audio**. While recording, SimpleSTT then mixes whatever your PC is playing (WASAPI loopback of the default output device — the other side of a call, a video, a stream) with your microphone, so one click transcribes both sides. It takes effect on the next recording (no engine restart), and the status line shows "Listening to mic + desktop…". Use headphones in calls, otherwise your mic re-captures the speakers and you get echo. If the output device can't be captured it falls back to mic-only and says so.
+Click the **speaker icon** in the top-left of the window (it lights up blue when on). While recording, SimpleSTT then mixes whatever your PC is playing (WASAPI loopback of the default output device — the other side of a call, a video, a stream) with your microphone, so one click transcribes both sides. It takes effect on the next recording (no engine restart), and the status line shows "Listening to mic + desktop…". Use headphones in calls, otherwise your mic re-captures the speakers and you get echo. If the output device can't be captured it falls back to mic-only and says so.
 
 ## Uninstall
 
@@ -53,6 +54,10 @@ cargo build --release                 # stable, ~446 KB
 ```
 
 Release: bump `version` in `Cargo.toml`, then `git tag vX.Y.Z && git push --tags`; GitHub Actions builds and publishes the exe, and installed copies update themselves.
+
+## Icon
+
+The app icon is drawn by `tools/make_icon.py` (Pillow) into `assets/icon.res`, which build.rs links into the exe, so builds need neither Python nor rc.exe. The window version label (bottom) is read from `Cargo.toml`.
 
 ## License
 

@@ -28,12 +28,14 @@ use crate::{audio, update};
 
 // ---- layout (96-dpi units) ---------------------------------------------------------------------
 const W: i32 = 220;
-const H: i32 = 160;
+const H: i32 = 172;
 const CX: f32 = 110.0;
 const CY: f32 = 62.0;
 const R: f32 = 40.0;
 const GX: f32 = 196.0;
 const GY: f32 = 22.0;
+const TX: f32 = 24.0; // desktop-audio toggle (top-left)
+const TY: f32 = 22.0;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -43,6 +45,7 @@ const GRAY_H: u32 = rgb(0x4a, 0x4a, 0x57);
 const RED: u32 = rgb(0xe5, 0x48, 0x4d);
 const AMBER: u32 = rgb(0xf5, 0xa5, 0x24);
 const GREEN: u32 = rgb(0x30, 0xa4, 0x6c);
+const ACCENT: u32 = rgb(0x3b, 0xa3, 0xff);
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
@@ -59,6 +62,8 @@ static SETTINGS: AtomicIsize = AtomicIsize::new(0);
 static F_TEXT: AtomicIsize = AtomicIsize::new(0);
 static F_MIC: AtomicIsize = AtomicIsize::new(0);
 static F_GEAR: AtomicIsize = AtomicIsize::new(0);
+static F_VER: AtomicIsize = AtomicIsize::new(0);
+static DESKTOP: AtomicBool = AtomicBool::new(false);
 static T0: OnceLock<Instant> = OnceLock::new();
 static RESULT: Mutex<Option<String>> = Mutex::new(None);
 static CFG: Mutex<Option<Config>> = Mutex::new(None);
@@ -98,8 +103,11 @@ pub fn run() {
         let icons = if font_exists("Segoe Fluent Icons") { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" };
         F_MIC.store(make_font(icons, 34, 400) as isize, Relaxed);
         F_GEAR.store(make_font(icons, 17, 400) as isize, Relaxed);
+        F_VER.store(make_font("Segoe UI", 10, 400) as isize, Relaxed);
 
-        *CFG.lock().unwrap() = Some(Config::load());
+        let c = Config::load();
+        DESKTOP.store(c.desktop, Relaxed);
+        *CFG.lock().unwrap() = Some(c);
 
         let hinst = GetModuleHandleW(null());
         let cls = w("SimpleSTTWnd");
@@ -109,7 +117,7 @@ pub fn run() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinst,
-            hIcon: null_mut(),
+            hIcon: LoadIconW(hinst, 1usize as *const u16),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszMenuName: null(),
@@ -134,6 +142,10 @@ pub fn run() {
             null(),
         );
         util::MAIN_HWND.store(hwnd as isize, Relaxed);
+        for (kind, cx, cy) in [(ICON_BIG, SM_CXICON, SM_CYICON), (ICON_SMALL, SM_CXSMICON, SM_CYSMICON)] {
+            let ic = LoadImageW(hinst, 1usize as *const u16, IMAGE_ICON, GetSystemMetrics(cx), GetSystemMetrics(cy), LR_DEFAULTCOLOR);
+            SendMessageW(hwnd, WM_SETICON, kind as usize, ic as isize);
+        }
         let dark = 1i32;
         DwmSetWindowAttribute(hwnd, 20, &dark as *const i32 as *const c_void, 4);
         ShowWindow(hwnd, SW_SHOW);
@@ -209,6 +221,20 @@ fn transcribe_chunk(a: &[i16]) -> Result<String, String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     engine::transcribe(a)
+}
+
+fn toggle_desktop() {
+    let st = STATE.load(Relaxed);
+    if st == REC || st == TRANS {
+        return; // the setting is read when a recording starts
+    }
+    let on = !DESKTOP.load(Relaxed);
+    DESKTOP.store(on, Relaxed);
+    let mut c = cfg();
+    c.desktop = on;
+    c.save();
+    *CFG.lock().unwrap() = Some(c);
+    engine::set_status(if on { "Desktop audio on" } else { "Desktop audio off" }, false);
 }
 
 fn start_rec() {
@@ -296,6 +322,8 @@ fn hit(x: i32, y: i32) -> u8 {
         1
     } else if d(GX, GY) <= sf(16.0).powi(2) {
         2
+    } else if d(TX, TY) <= sf(16.0).powi(2) {
+        3
     } else {
         0
     }
@@ -379,19 +407,33 @@ unsafe fn paint(hwnd: HWND) {
             arc(g, cx, cy, ring, sf(3.0), argb(c, 255), (t * 420.0) % 360.0, 90.0);
         }
     }
+    let desk = DESKTOP.load(Relaxed);
+    if desk {
+        fill_circle(g, sf(TX), sf(TY), sf(15.0), argb(ACCENT, 60));
+        arc(g, sf(TX), sf(TY), sf(15.0), sf(1.5), argb(ACCENT, 255), 0.0, 360.0);
+    }
     GdipDeleteGraphics(g);
 
     glyph(mem, F_MIC.load(Relaxed), icon, cx, cy, r, rgb(255, 255, 255));
     let gc = if hover == 2 { rgb(255, 255, 255) } else { rgb(0x9a, 0x9a, 0xa5) };
     glyph(mem, F_GEAR.load(Relaxed), '\u{E713}', sf(GX), sf(GY), sf(16.0), gc);
+    let tc = if desk { rgb(255, 255, 255) } else if hover == 3 { rgb(0xd0, 0xd0, 0xd8) } else { rgb(0x7a, 0x7a, 0x86) };
+    // speaker = desktop audio included, muted speaker = mic only
+    glyph(mem, F_GEAR.load(Relaxed), if desk { '\u{E767}' } else { '\u{E74F}' }, sf(TX), sf(TY), sf(16.0), tc);
 
     // status line
     let old_f = SelectObject(mem, F_TEXT.load(Relaxed) as HFONT);
     SetBkMode(mem, TRANSPARENT as i32);
     SetTextColor(mem, if engine::STATUS_BAD.load(Relaxed) { rgb(0xff, 0x8a, 0x8a) } else { rgb(0x9a, 0x9a, 0xa5) });
-    let mut tr = RECT { left: s(10), top: s(114), right: rc.right - s(10), bottom: rc.bottom - s(4) };
+    let mut tr = RECT { left: s(10), top: s(114), right: rc.right - s(10), bottom: rc.bottom - s(18) };
     let txt = w(&engine::status());
     DrawTextW(mem, txt.as_ptr(), -1, &mut tr, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+    // tiny version label
+    SelectObject(mem, F_VER.load(Relaxed) as HFONT);
+    SetTextColor(mem, rgb(0x62, 0x62, 0x6e));
+    let mut vr = RECT { left: 0, top: rc.bottom - s(17), right: rc.right, bottom: rc.bottom - s(3) };
+    let ver = w(concat!("v", env!("CARGO_PKG_VERSION")));
+    DrawTextW(mem, ver.as_ptr(), -1, &mut vr, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(mem, old_f);
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
@@ -443,6 +485,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             match hit(lo(lp), hi(lp)) {
                 1 => toggle_mic(),
                 2 => open_settings(hwnd),
+                3 => toggle_desktop(),
                 _ => {}
             }
             0
@@ -501,7 +544,6 @@ const ID_BROWSE: i32 = 102;
 const ID_MODEL: i32 = 103;
 const ID_LANG: i32 = 104;
 const ID_DELETE: i32 = 107;
-const ID_DESKTOP: i32 = 108;
 
 unsafe fn open_settings(parent: HWND) {
     let existing = SETTINGS.load(Relaxed) as HWND;
@@ -528,7 +570,7 @@ unsafe fn open_settings(parent: HWND) {
         RegisterClassW(&wc);
     });
     let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    let mut r = RECT { left: 0, top: 0, right: s(460), bottom: s(316) };
+    let mut r = RECT { left: 0, top: 0, right: s(460), bottom: s(300) };
     AdjustWindowRectEx(&mut r, style, 0, 0);
     let (ww, wh) = (r.right - r.left, r.bottom - r.top);
     let mut pr: RECT = std::mem::zeroed();
@@ -641,12 +683,10 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             ctl(hwnd, "STATIC", "Language  (auto, en, de, fr, es, … — .en models always use English)", 0, 16, 134, 428, 18, 0);
             ctl(hwnd, "EDIT", &c.lang, EDIT, 16, 154, 120, 24, ID_LANG);
             let dd = format!("Engine, cache and settings live in:\n{}", util::data_dir().display());
-            let cbx = ctl(hwnd, "BUTTON", "Also capture desktop audio (for calls — use headphones to avoid echo)", BTN | 3 /* BS_AUTOCHECKBOX */, 16, 192, 428, 22, ID_DESKTOP);
-            SendMessageW(cbx, BM_SETCHECK, c.desktop as usize, 0);
-            ctl(hwnd, "STATIC", &dd, 0, 16, 226, 428, 36, 0);
-            ctl(hwnd, "BUTTON", "Delete all data…", BTN, 16, 272, 130, 30, ID_DELETE);
-            ctl(hwnd, "BUTTON", "Save", BTN | 1 /* BS_DEFPUSHBUTTON */, 274, 272, 80, 30, 1);
-            ctl(hwnd, "BUTTON", "Cancel", BTN, 364, 272, 80, 30, 2);
+            ctl(hwnd, "STATIC", &dd, 0, 16, 196, 428, 36, 0);
+            ctl(hwnd, "BUTTON", "Delete all data…", BTN, 16, 252, 130, 30, ID_DELETE);
+            ctl(hwnd, "BUTTON", "Save", BTN | 1 /* BS_DEFPUSHBUTTON */, 274, 252, 80, 30, 1);
+            ctl(hwnd, "BUTTON", "Cancel", BTN, 364, 252, 80, 30, 2);
             0
         }
         WM_COMMAND => {
@@ -675,12 +715,11 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         models_dir: if dir.trim().is_empty() { old.models_dir.clone() } else { PathBuf::from(dir.trim()) },
                         model: MODELS[i.min(MODELS.len() - 1)].0.to_string(),
                         lang: if lang.is_empty() { "auto".into() } else { lang },
-                        desktop: SendMessageW(GetDlgItem(hwnd, ID_DESKTOP), BM_GETCHECK, 0, 0) == 1,
+                        desktop: old.desktop, // toggled on the main window
                     };
                     if new != old {
                         new.save();
                         *CFG.lock().unwrap() = Some(new.clone());
-                        // the desktop-audio toggle takes effect on the next recording; no engine restart
                         if !new.engine_differs(&old) {
                         } else if STATE.load(Relaxed) == IDLE {
                             engine::start_setup(new);
