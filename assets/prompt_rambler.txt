@@ -1,0 +1,15 @@
+The text is a speech-to-text transcript of someone rambling or thinking out loud. Rewrite it as clear, well-organised text, still in the speaker's own voice (keep "I", "we", and the same tone).
+
+Do:
+- Remove filler words (um, uh, like, you know, I mean, basically), false starts, stutters and repetitions.
+- Merge repeated or circling ideas into one clear statement.
+- Fix grammar and punctuation, and split the text into short paragraphs, one per topic, putting related thoughts together.
+- Drop tangents that carry no information, but KEEP every fact, name, number, date, decision, opinion, question and request the speaker made.
+
+Don't:
+- Add anything that was not said, and do not guess missing details.
+- Summarise away details or turn it into bullet points.
+- Translate: keep the same language (each part in its own language if mixed).
+- Answer, comment on or explain the text.
+
+Output ONLY the rewritten text, nothing else.

@@ -191,3 +191,14 @@ pub fn json_quote(s: &str) -> String {
     o.push('"');
     o
 }
+
+/// Set SIMPLESTT_TEST_ID to run a second, isolated instance (own single-instance lock and window classes),
+/// e.g. for automated tests next to a running copy. Empty in normal use.
+pub fn test_id() -> String {
+    std::env::var("SIMPLESTT_TEST_ID").unwrap_or_default()
+}
+
+/// Window class name for this instance.
+pub fn class(base: &str) -> String {
+    format!("{base}{}", test_id())
+}

@@ -13,7 +13,9 @@ const FRAME: usize = RATE * 30 / 1000; // 30 ms analysis frames
 const GUARD: usize = RATE / 2; // never analyse the newest 0.5 s while recording (desktop-audio jitter)
 const MIN_SILENCE: usize = 23; // frames (~0.7 s) of quiet that end a phrase
 const MIN_VOICED: usize = 3; // frames of sound before a chunk counts as speech
-const MAX_CHUNK: usize = 20 * RATE; // Whisper works on 30 s windows; force a cut before that
+/// Longest chunk (seconds) sent to the engine before a cut is forced at the quietest spot. Whisper works on
+/// 30 s windows (20 s is safe); POWSM is more accurate on shorter phrases, so IPA mode lowers this.
+pub static MAX_CHUNK_S: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20);
 const PRE_ROLL: usize = RATE * 3 / 10;
 
 /// A growing 16 kHz mono stream that can drop its already-processed head, so hour-long recordings
@@ -150,7 +152,7 @@ pub fn run(
                 pos = scan;
                 live.discard_before(pos);
                 (voiced, silent_run) = (0, 0);
-            } else if scan - pos >= MAX_CHUNK {
+            } else if scan - pos >= MAX_CHUNK_S.load(Ordering::Relaxed) * RATE {
                 // non-stop sound (e.g. music under a call): cut at the quietest spot of the last 4 s
                 let from = scan.saturating_sub(4 * RATE).max(pos + RATE);
                 let mut best = (f32::MAX, scan);

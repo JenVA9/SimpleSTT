@@ -4,7 +4,7 @@ A tiny (~390 KB) Windows speech-to-text widget. Click the mic, talk, click again
 
 - **Mic button**: grey = idle · red (pulsing) = listening · amber = transcribing · **green = done, copied to clipboard**
 - **Speaker button** (top-left): toggle **desktop audio capture** for calls (muted speaker = mic only, lit speaker = mic + PC sound)
-- **Gear button**: model folders, models (incl. your own files), language, IPA/AI options, or **delete everything**
+- **Gear button**: model folders, models (incl. your own files), language, **text AI mode**, or **delete everything**
 - Runs [whisper.cpp](https://github.com/ggml-org/whisper.cpp) on your NVIDIA GPU (CUDA) with the model kept resident in VRAM, so dictation takes a fraction of a second. Falls back to CPU automatically on machines without an NVIDIA GPU.
 - **No admin rights, no installer.** Download `SimpleSTT.exe`, run it. Everything it installs lives in `%LOCALAPPDATA%\SimpleSTT` (engines, runtime, caches, settings); models go to the folders you choose.
 - **Self-updating**: on launch it checks this repo's latest release, verifies the SHA-256, swaps itself and restarts. Updating never re-runs the first-run wizard.
@@ -37,7 +37,7 @@ Click the **speaker icon** in the top-left of the window (it lights up blue when
 Pick **powsm-ipa** as the model to get the International Phonetic Alphabet instead of words ([POWSM](https://huggingface.co/espnet/powsm), CMU's Phonetic Open Whisper-style Speech Model, CC-BY-4.0). Two stages:
 
 1. **POWSM** turns speech into IPA phones (language-independent; the model sees fixed 20 s windows, ~0.9 s each on an RTX 5080). Raw output looks like `əndsoʊmaɪfɛloʊəmɛɹɪkənz…` — no spaces between words.
-2. **Gemma 4** (a small local LLM, reasoning **off**) writes those phones out as properly spelled and punctuated text, in whatever language(s) were spoken. Its prompt (`assets/ipa_prompt.txt`) tells it that a recording can switch language mid-sentence, that every part should be written in its own language and script, and that **if part of the speech isn't a language it recognises it must pick the closest language that fits the sounds** instead of leaving IPA. The AI stage can be switched off in settings to get raw IPA.
+2. **Gemma 4** (a small local LLM, reasoning **off**) writes those phones out as properly spelled and punctuated text, in whatever language(s) were spoken. Its prompt (`assets/ipa_prompt.txt`) tells it that a recording can switch language mid-sentence, that every part should be written in its own language and script, and that **if part of the speech isn't a language it recognises it must pick the closest language that fits the sounds** instead of leaving IPA. The AI stage can be switched off (Text AI mode → Off) to get raw IPA.
 
 > ⚠ **IPA + AI is experimental and can hallucinate** — it may invent, change or "fix" words that weren't said. It is designed for multilingual or unreliable speech (several languages, accents, noisy audio). For normal single-language dictation a regular Whisper model is more accurate.
 
@@ -45,6 +45,18 @@ Pick **powsm-ipa** as the model to get the International Phonetic Alphabet inste
 
 **Nothing IPA-related is downloaded at startup, ever.** Selecting the IPA model shows a warning dialog listing every component, its size and its destination (Python/PyTorch/ESPnet runtime ~4.2 GB CUDA or ~0.8 GB CPU, POWSM 1.3 GB, llama.cpp text engine ~30 MB, Gemma model 2–4 GB for the small ones), the free disk space needed while installing, and the hallucination warning. Only **Yes** starts anything, and editing the config by hand can't trigger it either. POWSM is a PyTorch/ESPnet model whisper.cpp can't run, so it uses a private Python installed with a pinned copy of [uv](https://github.com/astral-sh/uv) into `%LOCALAPPDATA%\SimpleSTT\ipa` (no system changes, no admin); the text engine is a pinned [llama.cpp](https://github.com/ggml-org/llama.cpp) build (Vulkan, or CPU-only if there's no Vulkan driver). All model files are SHA-256 verified against pinned commits.
 
+## Text AI modes
+
+Settings → **Text AI mode** runs the transcript through the local Gemma model (same engine and model folder as IPA mode; it works with normal Whisper models too):
+
+| Mode | Normal speech-to-text | IPA mode |
+|---|---|---|
+| **Off** | the raw transcript | raw phones — *not recommended* |
+| **Simple** | a grammar/sense checker: fixes punctuation, recognition slips and grammar with the **fewest changes possible** (keeps your wording, language and order; never answers or translates) | phones → written text (as before) |
+| **Rambler** | turns rambling/thinking-out-loud into clear paragraphs in your own voice: drops filler, false starts and repeats, keeps every fact, number, name, decision and opinion | phones → text, then the same rewrite |
+| **Cliffnotes + TL;DR** | `TL;DR:` one-liner plus short key-point bullets | phones → text, then the same notes |
+
+Rambler and Cliffnotes work on the whole recording, but **group by group while you are still talking** (about 350 words per group, rewritten in the background), so pressing stop only has to process the last group — the wait doesn't grow with recording length. Cliffnotes over several groups merges their TL;DRs into one. The temp file keeps the raw per-phrase text. All modes stay in the language(s) you spoke. Text AI is never fetched until you pick a mode ≠ Off and confirm the download dialog; plain Whisper dictation (Off) never touches it. Models/modes can hallucinate — check important text.
 ## Uninstall
 
 Settings → **Delete all data…** removes the engines, the IPA runtime, the CUDA cache, settings and every model file SimpleSTT itself downloaded (in your own model folders it only removes those exact files, never anything else, and never custom files you picked). Then delete `SimpleSTT.exe`.

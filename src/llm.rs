@@ -16,6 +16,53 @@ use std::time::{Duration, Instant};
 use crate::engine::{self, Config, CUSTOM};
 use crate::util;
 
+// ---- AI mode --------------------------------------------------------------------------------------
+/// What the text AI does with the transcript.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AiMode {
+    /// raw output (for IPA: raw phones — not recommended)
+    Off,
+    /// IPA → written text; for normal STT a minimal-change grammar/sense fix
+    Simple,
+    /// rambling speech → clear, organised text (same voice, nothing that matters dropped)
+    Rambler,
+    /// Cliffnotes: key points plus a one-line TL;DR
+    Cliff,
+}
+
+impl AiMode {
+    pub const ALL: [AiMode; 4] = [AiMode::Off, AiMode::Simple, AiMode::Rambler, AiMode::Cliff];
+    pub fn id(self) -> &'static str {
+        match self {
+            AiMode::Off => "off",
+            AiMode::Simple => "simple",
+            AiMode::Rambler => "rambler",
+            AiMode::Cliff => "cliff",
+        }
+    }
+    pub fn parse(s: &str) -> Option<AiMode> {
+        AiMode::ALL.into_iter().find(|m| m.id() == s)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            AiMode::Off => "Off  (not recommended for IPA — raw phones)",
+            AiMode::Simple => "Simple  (IPA → text · grammar fix with minimal changes)",
+            AiMode::Rambler => "Rambler  (turns rambling into clear paragraphs)",
+            AiMode::Cliff => "Cliffnotes + TL;DR  (key points and a one-line summary)",
+        }
+    }
+}
+
+static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_mode(m: AiMode) {
+    MODE.store(AiMode::ALL.iter().position(|x| *x == m).unwrap_or(0) as u8, Relaxed);
+}
+
+pub fn mode() -> AiMode {
+    AiMode::ALL[(MODE.load(Relaxed) as usize).min(3)]
+}
+
 // ---- model catalog ----------------------------------------------------------------------------
 pub struct TextModel {
     pub id: &'static str,
@@ -310,17 +357,22 @@ pub fn launch(exe: &Path, model: &Path, gen: u32) -> Result<(), String> {
         .port();
     PORT.store(port, Relaxed);
     let gpu_layers = if variant().0 == "cpu" { "0" } else { "999" };
+    let log = std::fs::File::create(llama_dir().join("server.log")).ok();
+    let (out, err) = match log.as_ref().and_then(|f| Some((f.try_clone().ok()?, f.try_clone().ok()?))) {
+        Some((a, b)) => (Stdio::from(a), Stdio::from(b)),
+        None => (Stdio::null(), Stdio::null()),
+    };
     let child = Command::new(exe)
         .arg("-m")
         .arg(model)
         .args(["--host", "127.0.0.1", "--port", &port.to_string()])
         // small context (a phrase of IPA + a little history), one slot, no web UI, no thinking
-        .args(["-c", "4096", "-np", "1", "-ngl", gpu_layers, "-fa", "on", "--reasoning", "off", "--no-ui", "--no-mmproj-auto"])
+        .args(["-c", "8192", "-np", "1", "-ngl", gpu_layers, "-fa", "on", "--reasoning", "off", "--no-ui", "--no-mmproj-auto"])
         .current_dir(exe.parent().unwrap_or(Path::new(".")))
         .creation_flags(0x0800_0000)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .map_err(|e| format!("Couldn't start text engine: {e}"))?;
     unsafe { AssignProcessToJobObject(engine::job() as _, child.as_raw_handle() as _) };
@@ -334,7 +386,7 @@ pub fn launch(exe: &Path, model: &Path, gen: u32) -> Result<(), String> {
         }
         if let Some(c) = SERVER.lock().unwrap().as_mut() {
             if let Ok(Some(_)) = c.try_wait() {
-                return Err("Text engine crashed on start — try a smaller text model".into());
+                return Err("Text engine crashed on start (out of GPU memory?) — try a smaller text model; see llama\\server.log".into());
             }
         }
         if health(port) == Some(200) {
@@ -347,19 +399,27 @@ pub fn launch(exe: &Path, model: &Path, gen: u32) -> Result<(), String> {
     }
 }
 
-// ---- formatting -------------------------------------------------------------------------------------
-const SYSTEM_PROMPT: &str = include_str!("../assets/ipa_prompt.txt");
+// ---- prompts & requests -------------------------------------------------------------------------------
+const P_IPA: &str = include_str!("../assets/ipa_prompt.txt");
 /// Worked examples ("IPA: …" / "OUT: …" line pairs) sent as chat turns: measurably more accurate than the
 /// prompt alone on Gemma 4 E4B (0.86 vs 0.75 on the en/de/ja test set).
-const EXAMPLES: &str = include_str!("../assets/ipa_examples.txt");
+const IPA_EXAMPLES: &str = include_str!("../assets/ipa_examples.txt");
+const P_SIMPLE: &str = include_str!("../assets/prompt_simple.txt");
+const P_RAMBLER: &str = include_str!("../assets/prompt_rambler.txt");
+const P_CLIFF: &str = include_str!("../assets/prompt_cliff.txt");
+const P_TLDR: &str = include_str!("../assets/prompt_tldr.txt");
 
-/// Builds the constant part of the request (system prompt + examples) once.
-fn prefix() -> &'static str {
+fn system_msg(prompt: &str) -> String {
+    format!("{{\"role\":\"system\",\"content\":{}}}", util::json_quote(prompt.trim()))
+}
+
+/// System prompt + few-shot examples for IPA decoding, built once.
+fn ipa_prefix() -> &'static str {
     static P: OnceLock<String> = OnceLock::new();
     P.get_or_init(|| {
-        let mut m = format!("{{\"role\":\"system\",\"content\":{}}}", util::json_quote(SYSTEM_PROMPT.trim()));
+        let mut m = system_msg(P_IPA);
         let mut ipa = "";
-        for l in EXAMPLES.lines() {
+        for l in IPA_EXAMPLES.lines() {
             if let Some(i) = l.strip_prefix("IPA: ") {
                 ipa = i;
             } else if let Some(o) = l.strip_prefix("OUT: ") {
@@ -374,15 +434,136 @@ fn prefix() -> &'static str {
     })
 }
 
-/// Turns one chunk of raw IPA into written text. Each chunk is formatted on its own: feeding earlier text
-/// back in made the model drift toward it (it invented continuations), so there is deliberately no context.
-pub fn format(ipa: &str) -> Result<String, String> {
+/// One chat completion against the local text engine. `prefix` is the JSON for the leading messages.
+fn complete(prefix: &str, user: &str, temperature: f32, max_tokens: u32) -> Result<String, String> {
     let body = format!(
-        "{{\"messages\":[{},{{\"role\":\"user\",\"content\":{}}}],\"temperature\":0.0,\"top_p\":0.95,\"top_k\":64,\"max_tokens\":400,\"stream\":false,\"cache_prompt\":true}}",
-        prefix(),
-        util::json_quote(&format!("IPA: {ipa}"))
+        "{{\"messages\":[{prefix},{{\"role\":\"user\",\"content\":{}}}],\"temperature\":{temperature},\"top_p\":0.95,\"top_k\":64,\"max_tokens\":{max_tokens},\"stream\":false,\"cache_prompt\":true}}",
+        util::json_quote(user)
     );
     let resp = engine::http_post(PORT.load(Relaxed), "/v1/chat/completions", "application/json", body.as_bytes(), Duration::from_secs(300))?;
     let text = util::json_str(&resp, "content").ok_or("text engine error")?;
     Ok(text.trim().trim_matches('`').trim().to_string())
+}
+
+/// IPA chunk → written text. Each chunk is decoded on its own: feeding earlier text back in made the
+/// model drift toward it (it invented continuations), so there is deliberately no context.
+pub fn decode_ipa(ipa: &str) -> Result<String, String> {
+    complete(ipa_prefix(), &format!("IPA: {ipa}"), 0.0, 400)
+}
+
+/// Runs the active mode's prompt once on a sample so the first real request isn't slow (GPU buffers and
+/// shader compilation: the first Rambler request took ~7 s cold vs ~1 s warm).
+pub fn warm() {
+    let sample = "so um I was thinking that we should you know move the meeting to thursday because the team is not ready yet and the client wants the report by friday";
+    let _ = match mode() {
+        AiMode::Off => return,
+        AiMode::Simple => grammar(sample),
+        AiMode::Rambler => complete(&system_msg(P_RAMBLER), sample, 0.2, 300),
+        AiMode::Cliff => complete(&system_msg(P_CLIFF), sample, 0.2, 300),
+    };
+}
+
+/// Normal STT, "Simple": fix grammar/punctuation/obvious errors with the fewest changes.
+pub fn grammar(text: &str) -> Result<String, String> {
+    let max = ((text.len() / 2) as u32 + 128).clamp(128, 1200);
+    complete(&system_msg(P_SIMPLE), text, 0.0, max)
+}
+
+// ---- Rambler / Cliffnotes: whole-recording transforms, done group by group ------------------------------
+/// Text is rewritten in groups of about this many characters (about 350 words) *while you are still talking*,
+/// so stopping only has to process the last group: a constant wait for a 30 s or a 3 h recording.
+const GROUP_CHARS: usize = 2200;
+
+/// `SIMPLESTT_GROUP_CHARS` overrides the group size (tests: exercise the multi-group path with a short clip).
+fn group_chars() -> usize {
+    std::env::var("SIMPLESTT_GROUP_CHARS").ok().and_then(|v| v.parse().ok()).unwrap_or(GROUP_CHARS)
+}
+
+#[derive(Default)]
+struct Acc {
+    pending: Vec<String>,
+    chars: usize,
+    done: Vec<String>,    // rambler: rewritten groups
+    tldrs: Vec<String>,   // cliff: one TL;DR per group
+    bullets: Vec<String>, // cliff: every bullet of every group
+}
+
+static ACC: Mutex<Acc> = Mutex::new(Acc { pending: Vec::new(), chars: 0, done: Vec::new(), tldrs: Vec::new(), bullets: Vec::new() });
+
+/// Forget everything collected so far (a new recording starts).
+pub fn acc_reset() {
+    if let Ok(mut a) = ACC.lock() {
+        *a = Acc::default();
+    }
+}
+
+fn process_group(a: &mut Acc) {
+    if a.pending.is_empty() {
+        return;
+    }
+    let text = a.pending.join(" ");
+    a.pending.clear();
+    a.chars = 0;
+    match mode() {
+        AiMode::Rambler => {
+            let max = ((text.len() as u32) + 200).clamp(300, 1800);
+            a.done.push(complete(&system_msg(P_RAMBLER), &text, 0.2, max).unwrap_or(text));
+        }
+        AiMode::Cliff => match complete(&system_msg(P_CLIFF), &text, 0.2, 600) {
+            Ok(out) => {
+                for l in out.lines() {
+                    let t = l.trim();
+                    if let Some(x) = t.strip_prefix("TL;DR:") {
+                        a.tldrs.push(x.trim().to_string());
+                    } else if let Some(b) = t.strip_prefix("- ").or_else(|| t.strip_prefix("• ")) {
+                        a.bullets.push(format!("- {}", b.trim()));
+                    }
+                }
+            }
+            // engine hiccup: keep the raw text rather than losing the group
+            Err(_) => a.bullets.push(format!("- {text}")),
+        },
+        _ => a.done.push(text),
+    }
+}
+
+/// A chunk of finished text arrived (called from the chunker thread). May block while a group is rewritten.
+pub fn acc_push(piece: &str) {
+    if !matches!(mode(), AiMode::Rambler | AiMode::Cliff) {
+        return;
+    }
+    if let Ok(mut a) = ACC.lock() {
+        a.chars += piece.chars().count();
+        a.pending.push(piece.to_string());
+        if a.chars >= group_chars() {
+            process_group(&mut a);
+        }
+    }
+}
+
+/// Final result for the whole recording (None unless the mode is Rambler/Cliff).
+pub fn acc_finish() -> Option<String> {
+    if !matches!(mode(), AiMode::Rambler | AiMode::Cliff) {
+        return None;
+    }
+    let mut a = ACC.lock().ok()?;
+    process_group(&mut a);
+    let out = if mode() == AiMode::Rambler {
+        a.done.join("\n\n")
+    } else {
+        let tldr = match a.tldrs.len() {
+            0 => String::new(),
+            1 => a.tldrs[0].clone(),
+            _ => complete(&system_msg(P_TLDR), &a.tldrs.join("\n"), 0.2, 120).unwrap_or_else(|_| a.tldrs[0].clone()),
+        };
+        let mut o = String::new();
+        if !tldr.is_empty() {
+            o.push_str(&format!("TL;DR: {tldr}\n\n"));
+        }
+        o.push_str("Key points:\n");
+        o.push_str(&a.bullets.join("\n"));
+        o
+    };
+    *a = Acc::default();
+    (!out.trim().is_empty()).then_some(out)
 }

@@ -110,10 +110,11 @@ pub fn run() {
             c.save();
         }
         DESKTOP.store(c.desktop, Relaxed);
+        crate::llm::set_mode(c.ai_mode);
         *CFG.lock().unwrap() = Some(c);
 
         let hinst = GetModuleHandleW(null());
-        let cls = w("SimpleSTTWnd");
+        let cls = w(&util::class("SimpleSTTWnd"));
         let wc = WNDCLASSW {
             style: 0,
             lpfnWndProc: Some(main_proc),
@@ -160,7 +161,9 @@ pub fn run() {
             engine::set_status("Welcome — quick setup…", false);
             dialogs::open_wizard(hwnd);
         }
-        update::spawn();
+        if util::test_id().is_empty() {
+            update::spawn(); // isolated test instances never self-update
+        }
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -250,6 +253,7 @@ fn toggle_desktop() {
 }
 
 fn start_rec() {
+    crate::llm::acc_reset();
     REC_STOP.store(false, Release);
     let (tx, rx) = mpsc::channel();
     let desktop = cfg().desktop;
@@ -276,6 +280,7 @@ fn start_rec() {
                     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(live_file()) {
                         let _ = writeln!(f, "{t}");
                     }
+                    crate::llm::acc_push(t); // Rambler / Cliffnotes: rewritten group by group while you talk
                 })
             });
             *REC_JOB.lock().unwrap() = Some((rec, chunker));
@@ -302,6 +307,11 @@ fn stop_rec() {
                 chunker.join().unwrap_or_else(|_| Err("transcription crashed".into()))
             }
             None => Ok(String::new()),
+        };
+        // Rambler / Cliffnotes: only the last group is still unprocessed, so this is quick
+        let res = match res {
+            Ok(t) if !t.is_empty() => Ok(crate::llm::acc_finish().unwrap_or(t)),
+            other => other,
         };
         finish(res);
     });
@@ -556,6 +566,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 pub(crate) fn apply_config(new: Config, restart: bool) {
     new.save();
     DESKTOP.store(new.desktop, Relaxed);
+    crate::llm::set_mode(new.ai_mode); // mode changes need no engine restart
     *CFG.lock().unwrap() = Some(new.clone());
     if !restart {
         return;

@@ -1,0 +1,14 @@
+The text is a speech-to-text transcript. Turn it into Cliffnotes with a TL;DR, using exactly this format:
+
+TL;DR: <one sentence, at most 25 words, that captures the whole point>
+
+Key points:
+- <short point>
+- <short point>
+
+Rules:
+- 3 to 8 bullet points (fewer if the text is short), each one short and self-contained. Cover the main points, decisions, numbers, names, dates and action items, in the order they came up.
+- Write in the same language as the text (never translate). Keep "TL;DR:" exactly as written, but write the heading "Key points:" in the text's language (for German: "Kernpunkte:").
+- Use only what the text says. Do not add, guess or comment.
+- If there is almost nothing to summarise, still give the TL;DR line and one or two bullets.
+- Output ONLY the notes in that format, nothing else.

@@ -19,7 +19,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 fn main() {
     // Single instance. After a self-update the old process is still closing, so wait for it.
     let relaunch = std::env::args().any(|a| a == "--relaunch");
-    let name = util::w("Local\\SimpleSTT.single");
+    let tid = util::test_id(); // empty unless SIMPLESTT_TEST_ID is set (isolated test instances)
+    let name = util::w(&format!("Local\\SimpleSTT.single{tid}"));
     for attempt in 0..30 {
         unsafe {
             let h = CreateMutexW(null(), 0, name.as_ptr());
@@ -28,7 +29,7 @@ fn main() {
                 break;
             }
             if !relaunch || attempt == 29 {
-                let w = FindWindowW(util::w("SimpleSTTWnd").as_ptr(), null());
+                let w = FindWindowW(util::w(&util::class("SimpleSTTWnd")).as_ptr(), null());
                 if !w.is_null() {
                     ShowWindow(w, SW_RESTORE);
                     SetForegroundWindow(w);

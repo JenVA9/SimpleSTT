@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::{self, CUSTOM, Config, MODELS};
-use crate::llm::{self, TEXT_MODELS};
+use crate::llm::{self, AiMode, TEXT_MODELS};
 use crate::ui::{apply_config, cfg, make_font, s};
 use crate::util::{self, from_wide, w};
 
@@ -136,7 +136,7 @@ unsafe fn fill_whisper(cb: HWND, d: &Config) {
             let tag = if *id == rec { "   ★ recommended" } else { "" };
             if engine::is_ipa(id) {
                 let ready = if engine::ipa_runtime_ready() && engine::powsm_model_ready(&d.models_dir) { "   ✓ ready" } else { "" };
-                format!("{id}  —  IPA phones (POWSM) + AI · {}+ extra downloads{ready}", fmt_mb(mb))
+                format!("{id}  —  IPA phones (POWSM) · {}+ extra downloads{ready}", fmt_mb(mb))
             } else {
                 let have = if engine::model_path_in(&d.models_dir, id).exists() { "   ✓ downloaded" } else { "" };
                 format!("{id}  —  {}{have}{tag}", fmt_mb(mb))
@@ -180,18 +180,24 @@ unsafe fn fill_text(cb: HWND, d: &Config) {
 }
 
 // ---- the "extra download" warning ---------------------------------------------------------------------
-/// Is everything IPA mode needs for `c` already on disk?
-pub fn ipa_ready(c: &Config) -> bool {
-    engine::ipa_runtime_ready()
-        && engine::powsm_model_ready(&c.models_dir)
-        && (!c.ipa_ai || (llm::llama_ready() && llm::text_model_ready(c)))
+/// Is everything the chosen model + AI mode needs already on disk?
+pub fn components_ready(c: &Config) -> bool {
+    (!engine::is_ipa(&c.model) || (engine::ipa_runtime_ready() && engine::powsm_model_ready(&c.models_dir)))
+        && (c.ai_mode == AiMode::Off || (llm::llama_ready() && llm::text_model_ready(c)))
 }
 
-/// IPA needs a Python/PyTorch runtime and (optionally) a text AI. Nothing is downloaded until the user says yes.
-pub unsafe fn confirm_ipa_download(owner: HWND, c: &Config) -> bool {
+/// Does `c` need any extra component at all (IPA runtime and/or text AI)?
+pub fn needs_extras(c: &Config) -> bool {
+    engine::is_ipa(&c.model) || c.ai_mode != AiMode::Off
+}
+
+/// IPA needs a Python/PyTorch runtime; any AI mode needs the text engine + a Gemma model. Nothing is
+/// downloaded until the user says yes.
+pub unsafe fn confirm_extra_download(owner: HWND, c: &Config) -> bool {
     let mut parts: Vec<String> = Vec::new();
     let (mut mb, mut peak) = (0u32, 0u32); // peak: wheels are cached while installing, then deleted
-    if !engine::ipa_runtime_ready() {
+    let ipa = engine::is_ipa(&c.model);
+    if ipa && !engine::ipa_runtime_ready() {
         let (r, kind) = if engine::has_nvidia() {
             (engine::IPA_RUNTIME_MB, "CUDA GPU build")
         } else {
@@ -201,12 +207,12 @@ pub unsafe fn confirm_ipa_download(owner: HWND, c: &Config) -> bool {
         peak += r * 2;
         parts.push(format!("  •  Python + PyTorch ({kind}) + ESPnet runtime: about {}\n      → {}\\ipa", fmt_mb(r), util::data_dir().display()));
     }
-    if !engine::powsm_model_ready(&c.models_dir) {
+    if ipa && !engine::powsm_model_ready(&c.models_dir) {
         mb += 1311;
         peak += 1311;
         parts.push(format!("  •  POWSM phone model: about 1.3 GB\n      → {}\\powsm", c.models_dir.display()));
     }
-    if c.ipa_ai {
+    if c.ai_mode != AiMode::Off {
         if !llm::llama_ready() {
             mb += llm::llama_mb();
             peak += llm::llama_mb();
@@ -220,18 +226,20 @@ pub unsafe fn confirm_ipa_download(owner: HWND, c: &Config) -> bool {
             }
         }
     }
-    let ai_note = if c.ipa_ai {
-        "\n\n⚠  IPA + AI is experimental. The AI can hallucinate: it may invent, change or \"fix\" words that weren't said. It is designed for multilingual or unreliable speech (several languages, accents, noisy audio). For normal single-language dictation a regular Whisper model is more accurate."
+    let ai_note = if c.ai_mode == AiMode::Off {
+        "\n\nAI is off: you'll get raw IPA phones.".to_string()
+    } else if ipa {
+        "\n\n⚠  IPA + AI is experimental. The AI can hallucinate: it may invent, change or \"fix\" words that weren't said. It is designed for multilingual or unreliable speech (several languages, accents, noisy audio). For normal single-language dictation a regular Whisper model is more accurate.".to_string()
     } else {
-        "\n\nAI formatting is off: you'll get raw IPA phones."
+        format!("\n\n⚠  \"{}\" runs your dictation through a local AI. It can change or invent words (Simple makes minimal edits; Rambler and Cliffnotes rewrite a lot), so check important text before you use it.", c.ai_mode.id())
     };
-    let body = if parts.is_empty() { "Everything IPA mode needs is already installed.".to_string() } else { parts.join("\n") };
+    let body = if parts.is_empty() { "Everything needed is already installed.".to_string() } else { parts.join("\n") };
     let text = format!(
-        "IPA mode needs extra components that normal dictation doesn't use:\n\n{body}\n\nTotal download: about {} (needs up to {} of free disk space while installing). This can take 10+ minutes. Nothing is installed until you click Yes, and \"Delete all data…\" removes it again.{ai_note}\n\nDownload and install now?",
+        "This needs extra components that plain Whisper dictation doesn't use:\n\n{body}\n\nTotal download: about {} (needs up to {} of free disk space while installing). This can take 10+ minutes. Nothing is installed until you click Yes, and \"Delete all data…\" removes it again.{ai_note}\n\nDownload and install now?",
         fmt_mb(mb),
         fmt_mb(peak),
     );
-    MessageBoxW(owner, w(&text).as_ptr(), w("IPA mode: extra download").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
+    MessageBoxW(owner, w(&text).as_ptr(), w("Extra download").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
 }
 
 /// Removes everything SimpleSTT put on disk (engines, runtime, models it downloaded, settings, caches).
@@ -276,7 +284,7 @@ const ID_TDIR: i32 = 105;
 const ID_TBROWSE: i32 = 106;
 const ID_DELETE: i32 = 107;
 const ID_TMODEL: i32 = 108;
-const ID_AI: i32 = 109;
+const ID_AI: i32 = 109; // the AI-mode combo
 
 fn sel_index(cb: HWND) -> usize {
     unsafe { SendMessageW(cb, CB_GETCURSEL, 0, 0).max(0) as usize }
@@ -366,9 +374,9 @@ pub unsafe fn open_settings(parent: HWND) {
         return;
     }
     static REG: Once = Once::new();
-    register("SimpleSTTSettings", Some(settings_proc), (COLOR_BTNFACE + 1) as HBRUSH, &REG);
+    register(&util::class("SimpleSTTSettings"), Some(settings_proc), (COLOR_BTNFACE + 1) as HBRUSH, &REG);
     *DRAFT.lock().unwrap() = Some(cfg());
-    let h = create_dialog(parent, "SimpleSTTSettings", "SimpleSTT settings", 460, 440);
+    let h = create_dialog(parent, &util::class("SimpleSTTSettings"), "SimpleSTT settings", 460, 440);
     SETTINGS.store(h as isize, Relaxed);
     // Non-modal: the main window stays usable. The settings window is *owned* by it, so it always stays
     // above the main window instead of disappearing behind it.
@@ -390,10 +398,13 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             ctl(hwnd, "STATIC", "Language  (auto, en, de, fr, es, … — .en models always use English)", 0, 16, 116, 428, 18, 0);
             ctl(hwnd, "EDIT", &c.lang, EDIT, 16, 134, 120, 24, ID_LANG);
 
-            ctl(hwnd, "STATIC", "IPA mode — text AI (only used with the powsm-ipa model)", 0, 16, 172, 428, 18, 0);
-            let ai = ctl(hwnd, "BUTTON", "Format IPA into written text with AI (Gemma 4). Can hallucinate — meant for multilingual or unreliable speech.", BTN | 3 | 0x2000 /* BS_AUTOCHECKBOX | BS_MULTILINE */, 16, 192, 428, 34, ID_AI);
-            SendMessageW(ai, BM_SETCHECK, c.ipa_ai as usize, 0);
-            ctl(hwnd, "STATIC", "Text models folder", 0, 16, 234, 428, 18, 0);
+            ctl(hwnd, "STATIC", "Text AI mode  (local Gemma model — can hallucinate)", 0, 16, 172, 428, 18, 0);
+            let ai = ctl(hwnd, "COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | 3, 16, 192, 428, 200, ID_AI);
+            for m in AiMode::ALL {
+                SendMessageW(ai, CB_ADDSTRING, 0, w(m.label()).as_ptr() as isize);
+            }
+            SendMessageW(ai, CB_SETCURSEL, AiMode::ALL.iter().position(|x| *x == c.ai_mode).unwrap_or(0), 0);
+            ctl(hwnd, "STATIC", "Text models folder  (used by every mode except Off)", 0, 16, 234, 428, 18, 0);
             ctl(hwnd, "EDIT", &c.text_dir.to_string_lossy(), EDIT, 16, 252, 340, 24, ID_TDIR);
             ctl(hwnd, "BUTTON", "Browse…", BTN, 364, 251, 80, 26, ID_TBROWSE);
             ctl(hwnd, "STATIC", "Text model  (up to 5 GB is loaded in memory)", 0, 16, 286, 428, 18, 0);
@@ -441,6 +452,10 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         fill_text(dlg(ID_TMODEL), &draft());
                     }
                 }
+                ID_AI if code == CBN_SELCHANGE as u32 => {
+                    let i = sel_index(dlg(ID_AI)).min(3);
+                    set_draft(|d| d.ai_mode = AiMode::ALL[i]);
+                }
                 ID_MODEL if code == CBN_SELCHANGE as u32 => on_combo_changed(hwnd, dlg(ID_MODEL), 0),
                 ID_TMODEL if code == CBN_SELCHANGE as u32 => on_combo_changed(hwnd, dlg(ID_TMODEL), 1),
                 1 => {
@@ -456,7 +471,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     }
                     let lang = get_text(dlg(ID_LANG)).trim().to_lowercase();
                     new.lang = if lang.is_empty() { "auto".into() } else { lang };
-                    new.ipa_ai = SendMessageW(dlg(ID_AI), BM_GETCHECK, 0, 0) == 1;
+                    new.ai_mode = AiMode::ALL[sel_index(dlg(ID_AI)).min(3)];
                     new.desktop = old.desktop; // toggled on the main window
                     new.onboarded = true;
                     // a custom entry without a file behaves like the previous choice
@@ -466,16 +481,16 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     if new.text_model == CUSTOM && new.custom_text.as_os_str().is_empty() {
                         new.text_model = old.text_model.clone();
                     }
-                    // IPA needs separate runtimes: ask first, install nothing without a yes
-                    let need_ipa = engine::is_ipa(&new.model) && !ipa_ready(&new);
-                    if need_ipa {
-                        if !confirm_ipa_download(hwnd, &new) {
+                    // IPA / AI need extra components: ask first, install nothing without a yes
+                    let need_dl = needs_extras(&new) && !components_ready(&new);
+                    if need_dl {
+                        if !confirm_extra_download(hwnd, &new) {
                             return 0; // stay in settings; nothing saved, nothing downloaded
                         }
                         engine::IPA_CONSENT.store(true, Relaxed);
                     }
-                    if new != old || need_ipa {
-                        let restart = new.engine_differs(&old) || need_ipa;
+                    if new != old || need_dl {
+                        let restart = new.engine_differs(&old) || need_dl;
                         apply_config(new, restart);
                     }
                     DestroyWindow(hwnd);
@@ -531,13 +546,13 @@ static PAGE: AtomicIsize = AtomicIsize::new(0);
 
 pub unsafe fn open_wizard(parent: HWND) {
     static REG: Once = Once::new();
-    register("SimpleSTTWizard", Some(wizard_proc), (COLOR_BTNFACE + 1) as HBRUSH, &REG);
+    register(&util::class("SimpleSTTWizard"), Some(wizard_proc), (COLOR_BTNFACE + 1) as HBRUSH, &REG);
     let mut d = cfg();
     d.model = llm::recommended_whisper().to_string();
     d.text_model = TEXT_MODELS[llm::recommended_text()].id.to_string();
     *DRAFT.lock().unwrap() = Some(d);
     PAGE.store(0, Relaxed);
-    let h = create_dialog(parent, "SimpleSTTWizard", "Welcome to SimpleSTT", 480, 290);
+    let h = create_dialog(parent, &util::class("SimpleSTTWizard"), "Welcome to SimpleSTT", 480, 290);
     WIZARD.store(h as isize, Relaxed);
     ShowWindow(h, SW_SHOW);
     SetForegroundWindow(h);
@@ -671,8 +686,11 @@ unsafe extern "system" fn wizard_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     if new.text_model == CUSTOM && new.custom_text.as_os_str().is_empty() {
                         new.text_model = TEXT_MODELS[llm::recommended_text()].id.to_string();
                     }
-                    if engine::is_ipa(&new.model) && !ipa_ready(&new) {
-                        if !confirm_ipa_download(hwnd, &new) {
+                    if engine::is_ipa(&new.model) && new.ai_mode == AiMode::Off {
+                        new.ai_mode = AiMode::Simple; // IPA without the AI is just raw phones; offer the useful default
+                    }
+                    if needs_extras(&new) && !components_ready(&new) {
+                        if !confirm_extra_download(hwnd, &new) {
                             return 0; // stay in the wizard
                         }
                         engine::IPA_CONSENT.store(true, Relaxed);

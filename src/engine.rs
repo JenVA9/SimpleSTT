@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering::*};
 use std::time::{Duration, Instant};
 
+use crate::llm::AiMode;
 use crate::{net, util};
 
 // ---- shared state -----------------------------------------------------------------------------
@@ -33,8 +34,6 @@ static SERVER: Mutex<Option<Child>> = Mutex::new(None);
 static SETUP_LOCK: Mutex<()> = Mutex::new(());
 /// true while the loaded engine is the IPA (POWSM) python server instead of whisper-server
 static IPA: AtomicBool = AtomicBool::new(false);
-/// IPA mode: pass the phones through the text model (Gemma) to get written text
-static IPA_AI: AtomicBool = AtomicBool::new(false);
 /// Set by the UI once the user accepted the "extra download" warning. Without it, setup refuses to fetch
 /// the IPA runtime/model, so a stray config edit can never trigger a multi-GB download.
 pub static IPA_CONSENT: AtomicBool = AtomicBool::new(false);
@@ -91,10 +90,10 @@ pub struct Config {
     pub lang: String,
     /// also capture what the PC is playing (calls, videos) and mix it with the mic
     pub desktop: bool,
-    /// IPA mode only: where the text (Gemma) models live, which one, and whether to use it at all
+    /// text AI (Gemma): where its models live, which one, and what it does (off / simple / rambler / cliff)
     pub text_dir: PathBuf,
     pub text_model: String,
-    pub ipa_ai: bool,
+    pub ai_mode: AiMode,
     /// user-picked model files for model == CUSTOM / text_model == CUSTOM
     pub custom_model: PathBuf,
     pub custom_text: PathBuf,
@@ -109,11 +108,10 @@ impl Config {
             || self.model != o.model
             || self.lang != o.lang
             || self.custom_model != o.custom_model
-            || (is_ipa(&self.model)
-                && (self.text_dir != o.text_dir
-                    || self.text_model != o.text_model
-                    || self.ipa_ai != o.ipa_ai
-                    || self.custom_text != o.custom_text))
+            // simple <-> rambler <-> cliff only changes prompts; turning the AI on/off or swapping its model restarts
+            || ((self.ai_mode == AiMode::Off) != (o.ai_mode == AiMode::Off))
+            || (self.ai_mode != AiMode::Off
+                && (self.text_dir != o.text_dir || self.text_model != o.text_model || self.custom_text != o.custom_text))
     }
 }
 
@@ -136,12 +134,13 @@ impl Config {
             desktop: false,
             text_dir: util::data_dir().join("text-models"),
             text_model: crate::llm::TEXT_MODELS[crate::llm::recommended_text()].id.into(),
-            ipa_ai: true,
+            ai_mode: AiMode::Off,
             custom_model: PathBuf::new(),
             custom_text: PathBuf::new(),
             // installs from before onboarding existed (and fresh updates of them) skip the wizard
             onboarded: existing_install(),
         };
+        let (mut ai_set, mut legacy_ipa_ai) = (false, true);
         if let Ok(t) = std::fs::read_to_string(Self::file()) {
             for l in t.lines() {
                 if let Some((k, v)) = l.split_once('=') {
@@ -151,7 +150,13 @@ impl Config {
                         "model" if v == CUSTOM || MODELS.iter().any(|m| m.0 == v) => c.model = v.into(),
                         "text_dir" if !v.is_empty() => c.text_dir = PathBuf::from(v),
                         "text_model" if v == CUSTOM || crate::llm::TEXT_MODELS.iter().any(|m| m.id == v) => c.text_model = v.into(),
-                        "ipa_ai" => c.ipa_ai = v != "0",
+                        "ai_mode" => {
+                            if let Some(m) = AiMode::parse(v) {
+                                c.ai_mode = m;
+                                ai_set = true;
+                            }
+                        }
+                        "ipa_ai" => legacy_ipa_ai = v != "0", // configs from before the mode selector
                         "custom_model" => c.custom_model = PathBuf::from(v),
                         "custom_text" => c.custom_text = PathBuf::from(v),
                         "onboarded" => c.onboarded = v == "1",
@@ -162,20 +167,24 @@ impl Config {
                 }
             }
         }
+        if !ai_set {
+            // old configs: IPA used the AI unless switched off; normal dictation never used it
+            c.ai_mode = if is_ipa(&c.model) && legacy_ipa_ai { AiMode::Simple } else { AiMode::Off };
+        }
         c
     }
 
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(util::data_dir());
         let t = format!(
-            "models_dir={}\nmodel={}\nlang={}\ndesktop={}\ntext_dir={}\ntext_model={}\nipa_ai={}\ncustom_model={}\ncustom_text={}\nonboarded={}\n",
+            "models_dir={}\nmodel={}\nlang={}\ndesktop={}\ntext_dir={}\ntext_model={}\nai_mode={}\ncustom_model={}\ncustom_text={}\nonboarded={}\n",
             self.models_dir.display(),
             self.model,
             self.lang,
             self.desktop as u8,
             self.text_dir.display(),
             self.text_model,
-            self.ipa_ai as u8,
+            self.ai_mode.id(),
             self.custom_model.display(),
             self.custom_text.display(),
             self.onboarded as u8
@@ -396,19 +405,28 @@ fn wait_ready(port: u16, gen: u32, crash_msg: &str) -> Result<(), String> {
 fn setup(cfg: &Config, gen: u32) -> Result<(), String> {
     setup_status(gen, "Starting…");
     IPA.store(is_ipa(&cfg.model), Relaxed);
-    IPA_AI.store(is_ipa(&cfg.model) && cfg.ipa_ai, Relaxed);
+    crate::llm::set_mode(cfg.ai_mode);
+    // longest chunk before a forced cut; shorter IPA chunks were measured (6 s / 10 s) and did NOT help,
+    // so it stays 20 s. SIMPLESTT_IPA_CHUNK_S is a test knob for that experiment.
+    let chunk_s = std::env::var("SIMPLESTT_IPA_CHUNK_S").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    crate::live::MAX_CHUNK_S.store(if is_ipa(&cfg.model) { chunk_s } else { 20 }, Relaxed);
     if is_ipa(&cfg.model) {
         return setup_ipa(cfg, gen);
     }
     let exe = ensure_engine(gen)?;
     let model = ensure_model(gen, cfg)?;
+    let text = ensure_text(gen, cfg)?;
     PROGRESS.store(-1, Relaxed);
     launch(&exe, &model, cfg, gen)?;
+    if let Some((llama, gguf)) = text {
+        crate::llm::launch(&llama, &gguf, gen)?;
+    }
     // Warm-up: the first GPU call on a brand-new architecture JIT-compiles kernels (tens of seconds,
     // cached afterwards). Do it now, in the background, instead of on the user's first dictation.
     setup_status(gen, "Warming up GPU…");
     let silence = vec![0i16; 16000];
     transcribe_raw(&silence, Duration::from_secs(600))?;
+    crate::llm::warm(); // first request allocates GPU buffers; do it now, not on the first dictation
     if !stale(gen) {
         READY.store(true, Relaxed);
         setup_status(gen, "Ready — click the mic");
@@ -540,11 +558,19 @@ fn clean(t: &str) -> String {
 
 pub fn transcribe(samples: &[i16]) -> Result<String, String> {
     let t = clean(&transcribe_raw(samples, Duration::from_secs(300))?);
-    if t.is_empty() || !IPA_AI.load(Relaxed) {
+    let mode = crate::llm::mode();
+    if t.is_empty() || mode == AiMode::Off {
         return Ok(t);
     }
-    // IPA + AI: written text from the phones; if the text engine hiccups, the raw IPA is still better than nothing
-    Ok(crate::llm::format(&t).map(|f| clean(&f)).unwrap_or(t))
+    // If the text engine hiccups, the raw text/phones are still better than nothing.
+    if IPA.load(Relaxed) {
+        // every AI mode first turns the phones into words, chunk by chunk
+        return Ok(crate::llm::decode_ipa(&t).map(|f| clean(&f)).unwrap_or(t));
+    }
+    if mode == AiMode::Simple {
+        return Ok(crate::llm::grammar(&t).map(|f| clean(&f)).unwrap_or(t));
+    }
+    Ok(t) // rambler / cliffnotes work on whole groups of text later (llm::acc_*)
 }
 
 // ---- IPA (POWSM) --------------------------------------------------------------------------------
@@ -834,6 +860,12 @@ fn launch_ipa(root: &Path, cfg: &Config, gen: u32) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .port();
     PORT.store(port, Relaxed);
+    // keep the server's output (import errors, CUDA out-of-memory, ...) for diagnosing start-up failures
+    let log = std::fs::File::create(dir.join("server.log")).ok();
+    let (out, err) = match log.as_ref().and_then(|f| Some((f.try_clone().ok()?, f.try_clone().ok()?))) {
+        Some((a, b)) => (Stdio::from(a), Stdio::from(b)),
+        None => (Stdio::null(), Stdio::null()),
+    };
     let child = Command::new(ipa_python())
         .arg(&script)
         .arg("--root")
@@ -847,14 +879,14 @@ fn launch_ipa(root: &Path, cfg: &Config, gen: u32) -> Result<(), String> {
         .env("PYTHONUNBUFFERED", "1")
         .creation_flags(0x0800_0000)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .map_err(|e| format!("Couldn't start IPA engine: {e}"))?;
     unsafe { AssignProcessToJobObject(job() as _, child.as_raw_handle() as _) };
     *SERVER.lock().unwrap() = Some(child);
     setup_status(gen, "Loading IPA model…");
-    wait_ready(port, gen, "IPA engine crashed on start")
+    wait_ready(port, gen, "IPA engine crashed on start (out of GPU memory? close other GPU apps) — see ipa\\server.log")
 }
 
 fn setup_ipa(cfg: &Config, gen: u32) -> Result<(), String> {
@@ -866,16 +898,7 @@ fn setup_ipa(cfg: &Config, gen: u32) -> Result<(), String> {
     }
     let root = ensure_powsm(gen, cfg)?;
     // optional text stage (Gemma): engine + model are only fetched with the same consent as the runtime
-    let text = if cfg.ipa_ai {
-        if !crate::llm::llama_ready() && !IPA_CONSENT.load(Relaxed) {
-            return Err("Text engine missing — pick IPA again in settings to download".into());
-        }
-        let exe = crate::llm::ensure_llama(gen)?;
-        let model = crate::llm::ensure_text_model(gen, cfg)?;
-        Some((exe, model))
-    } else {
-        None
-    };
+    let text = ensure_text(gen, cfg)?;
     PROGRESS.store(-1, Relaxed);
     launch_ipa(&root, cfg, gen)?;
     if let Some((exe, model)) = text {
@@ -883,8 +906,9 @@ fn setup_ipa(cfg: &Config, gen: u32) -> Result<(), String> {
     }
     setup_status(gen, "Warming up GPU…");
     transcribe_raw(&vec![0i16; 16000], Duration::from_secs(900))?;
-    if IPA_AI.load(Relaxed) {
-        let _ = crate::llm::format("hɛloʊwɜːld"); // first request compiles/allocates; do it now
+    if crate::llm::mode() != AiMode::Off {
+        let _ = crate::llm::decode_ipa("hɛloʊwɜːld"); // first request allocates buffers; do it now
+        crate::llm::warm();
     }
     if !stale(gen) {
         READY.store(true, Relaxed);
@@ -892,4 +916,17 @@ fn setup_ipa(cfg: &Config, gen: u32) -> Result<(), String> {
         util::refresh();
     }
     Ok(())
+}
+
+/// Text AI (Gemma) for any mode except Off: engine + model, fetched only with the user's consent.
+fn ensure_text(gen: u32, cfg: &Config) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    if cfg.ai_mode == AiMode::Off {
+        return Ok(None);
+    }
+    if !(crate::llm::llama_ready() && crate::llm::text_model_ready(cfg)) && !IPA_CONSENT.load(Relaxed) {
+        return Err("Text AI needs a download — pick the AI mode again in settings".into());
+    }
+    let exe = crate::llm::ensure_llama(gen)?;
+    let model = crate::llm::ensure_text_model(gen, cfg)?;
+    Ok(Some((exe, model)))
 }
