@@ -27,13 +27,18 @@ Measured on an RTX 5080 with `medium.en`, 153 s of speech: stop-to-clipboard **4
 
 Click the **speaker icon** in the top-left of the window (it lights up blue when on). While recording, SimpleSTT then mixes whatever your PC is playing (WASAPI loopback of the default output device — the other side of a call, a video, a stream) with your microphone, so one click transcribes both sides. It takes effect on the next recording (no engine restart), and the status line shows "Listening to mic + desktop…". Use headphones in calls, otherwise your mic re-captures the speakers and you get echo. If the output device can't be captured it falls back to mic-only and says so.
 
+## IPA mode (phone recognition)
+
+Pick **powsm-ipa** in Settings → Model to get the International Phonetic Alphabet instead of words, e.g. `əndsoʊmaɪfɛloʊəmɛɹɪkənz…` ([POWSM](https://huggingface.co/espnet/powsm), CMU's Phonetic Open Whisper-style Speech Model, CC-BY-4.0). It works with the live chunking, the desktop-audio toggle and the clipboard exactly like normal dictation (the model sees fixed 20 s windows, ~0.9 s each on an RTX 5080). Output has no spaces between words — that's how the model emits phones. The language setting accepts ISO 639-3 or common 2-letter codes; `auto` is language-independent.
+
+POWSM is a PyTorch/ESPnet model that whisper.cpp can't run, so it needs a separate **Python + PyTorch + ESPnet runtime (~4.2 GB with CUDA, ~0.8 GB CPU-only)** plus the 1.3 GB model. **None of this is downloaded unless you pick the IPA model and click Yes in a warning dialog that lists the sizes and locations.** Nothing about it happens at startup, and editing the config by hand can't trigger it either. The runtime is installed with a pinned copy of [uv](https://github.com/astral-sh/uv) into `%LOCALAPPDATA%\SimpleSTT\ipa` (private Python, no system changes, no admin) and the model files (SHA-256 verified, pinned commit) go to `<models folder>\powsm`. **Delete all data…** removes both.
 ## Uninstall
 
 Settings → **Delete all data…** removes the engine, all models it downloaded, the CUDA cache and settings (in a custom models folder it only removes the `ggml-*.bin` files it created). Then delete `SimpleSTT.exe`.
 
 ## Models
 
-`tiny.en`, `base.en`, `small.en`, `medium.en`, `tiny`, `base`, `small`, `medium`, `large-v3-turbo-q5_0` (default), `large-v3-turbo`, `large-v3` — downloaded from [ggerganov/whisper.cpp on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp) the first time they're selected (resumable).
+`tiny.en`, `base.en`, `small.en`, `medium.en`, `tiny`, `base`, `small`, `medium`, `large-v3-turbo-q5_0` (default), `large-v3-turbo`, `large-v3`, and `powsm-ipa` (IPA phones, see above) — downloaded from [ggerganov/whisper.cpp on Hugging Face](https://huggingface.co/ggerganov/whisper.cpp) the first time they're selected (resumable).
 
 ## How it's built small and fast
 

@@ -31,6 +31,11 @@ static STATUS: Mutex<String> = Mutex::new(String::new());
 static SERVER: Mutex<Option<Child>> = Mutex::new(None);
 /// Only one setup run at a time: a cancelled run must fully stop before the next touches the files.
 static SETUP_LOCK: Mutex<()> = Mutex::new(());
+/// true while the loaded engine is the IPA (POWSM) python server instead of whisper-server
+static IPA: AtomicBool = AtomicBool::new(false);
+/// Set by the UI once the user accepted the "extra download" warning. Without it, setup refuses to fetch
+/// the IPA runtime/model, so a stray config edit can never trigger a multi-GB download.
+pub static IPA_CONSENT: AtomicBool = AtomicBool::new(false);
 
 pub fn status() -> String {
     STATUS.lock().map(|s| s.clone()).unwrap_or_default()
@@ -65,7 +70,14 @@ pub const MODELS: &[(&str, u32)] = &[
     ("large-v3-turbo-q5_0", 574),
     ("large-v3-turbo", 1624),
     ("large-v3", 3095),
+    // IPA phone recognition (POWSM). Needs an extra Python/PyTorch runtime that is only fetched on demand.
+    (IPA_MODEL, 1311),
 ];
+
+pub const IPA_MODEL: &str = "powsm-ipa";
+pub fn is_ipa(model: &str) -> bool {
+    model == IPA_MODEL
+}
 
 #[derive(Clone, PartialEq)]
 pub struct Config {
@@ -130,6 +142,10 @@ impl Config {
 }
 
 pub fn model_path_in(dir: &Path, model: &str) -> PathBuf {
+    if is_ipa(model) {
+        // the big checkpoint; the other POWSM files sit beside it (see powsm_files)
+        return dir.join("powsm").join(POWSM_EXP).join("valid.acc.ave_5best.till45epoch.pth");
+    }
     dir.join(format!("ggml-{model}.bin"))
 }
 
@@ -149,7 +165,7 @@ const CPU: (&str, &str, &str, u32) = (
     8,
 );
 
-fn has_nvidia() -> bool {
+pub fn has_nvidia() -> bool {
     use windows_sys::Win32::System::LibraryLoader::LoadLibraryA;
     unsafe { !LoadLibraryA(b"nvcuda.dll\0".as_ptr()).is_null() }
 }
@@ -300,6 +316,11 @@ fn launch(exe: &Path, model: &Path, cfg: &Config, gen: u32) -> Result<(), String
     *SERVER.lock().unwrap() = Some(child);
 
     setup_status(gen, "Loading model…");
+    wait_ready(port, gen, "Engine crashed on start — try another model")
+}
+
+/// Waits until the freshly spawned server accepts connections (it only listens once the model is loaded).
+fn wait_ready(port: u16, gen: u32, crash_msg: &str) -> Result<(), String> {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let t0 = Instant::now();
     loop {
@@ -308,7 +329,7 @@ fn launch(exe: &Path, model: &Path, cfg: &Config, gen: u32) -> Result<(), String
         }
         if let Some(c) = SERVER.lock().unwrap().as_mut() {
             if let Ok(Some(_)) = c.try_wait() {
-                return Err("Engine crashed on start — try another model".into());
+                return Err(crash_msg.into());
             }
         }
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
@@ -323,6 +344,10 @@ fn launch(exe: &Path, model: &Path, cfg: &Config, gen: u32) -> Result<(), String
 
 fn setup(cfg: &Config, gen: u32) -> Result<(), String> {
     setup_status(gen, "Starting…");
+    IPA.store(is_ipa(&cfg.model), Relaxed);
+    if is_ipa(&cfg.model) {
+        return setup_ipa(cfg, gen);
+    }
     let exe = ensure_engine(gen)?;
     let model = ensure_model(gen, cfg)?;
     PROGRESS.store(-1, Relaxed);
@@ -396,6 +421,22 @@ fn wav(samples: &[i16]) -> Vec<u8> {
 
 fn transcribe_raw(samples: &[i16], timeout: Duration) -> Result<String, String> {
     const B: &str = "----SimpleSTTboundary7MA4YWxk";
+    let (path, ctype, body) = if IPA.load(Relaxed) {
+        // IPA server: raw 16 kHz mono s16le PCM in, {"text": "..."} out
+        let mut raw = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            raw.extend_from_slice(&s.to_le_bytes());
+        }
+        ("/ipa", "application/octet-stream".to_string(), raw)
+    } else {
+        ("/inference", format!("multipart/form-data; boundary={B}"), whisper_form(samples, B))
+    };
+    send_request(path, &ctype, &body, timeout)
+}
+
+#[allow(non_snake_case)]
+fn whisper_form(samples: &[i16], boundary: &str) -> Vec<u8> {
+    let B = boundary;
     let mut body = Vec::new();
     for (k, v) in [("temperature", "0.0"), ("response_format", "json")] {
         body.extend_from_slice(
@@ -410,16 +451,19 @@ fn transcribe_raw(samples: &[i16], timeout: Duration) -> Result<String, String> 
     );
     body.extend_from_slice(&wav(samples));
     body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+    body
+}
 
+fn send_request(path: &str, ctype: &str, body: &[u8], timeout: Duration) -> Result<String, String> {
     let port = PORT.load(Relaxed);
     let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|_| "engine not running".to_string())?;
     let _ = s.set_read_timeout(Some(timeout));
     let head = format!(
-        "POST /inference HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: multipart/form-data; boundary={B}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     s.write_all(head.as_bytes())
-        .and_then(|_| s.write_all(&body))
+        .and_then(|_| s.write_all(body))
         .map_err(|_| "engine not running".to_string())?;
     let mut resp = Vec::new();
     let _ = s.read_to_end(&mut resp);
@@ -439,4 +483,334 @@ fn clean(t: &str) -> String {
 
 pub fn transcribe(samples: &[i16]) -> Result<String, String> {
     transcribe_raw(samples, Duration::from_secs(300)).map(|t| clean(&t))
+}
+
+// ---- IPA (POWSM) --------------------------------------------------------------------------------
+// Phone recognition runs on the official POWSM checkpoint (ESPnet/PyTorch), which whisper.cpp can't load.
+// So it needs a private Python + PyTorch + ESPnet runtime. That runtime (~4.3 GB with CUDA libraries) is
+// NEVER fetched at startup: only after the user selects the IPA model and accepts the warning dialog
+// (see `IPA_CONSENT`). Everything lives under %LOCALAPPDATA%\SimpleSTT\ipa and is removed by "Delete all data".
+const POWSM_REV: &str = "21ffa410432ace159f3c1fdeed304c70eddf7d34"; // pinned commit of espnet/powsm
+const POWSM_EXP: &str = "exp/s2t_train_s2t_ebf_conv2d_size768_e9_d9_piecewise_lr5e-4_warmup60k_flashattn_raw_bpe40000";
+const UV_URL: &str = "https://github.com/astral-sh/uv/releases/download/0.13.1/uv-x86_64-pc-windows-msvc.zip";
+const UV_SHA: &str = "3b2661a463a5baea7f5076ea2b25ab71d77f36a6c0d809e5350651792f80a672";
+const IPA_MARK: &str = "ready-1"; // bump to force a runtime reinstall when the pinned packages change
+pub const IPA_RUNTIME_MB: u32 = 4300; // CUDA build; the CPU build is much smaller
+pub const IPA_RUNTIME_CPU_MB: u32 = 800;
+
+/// (path inside the repo, sha256). Stored under <models folder>/powsm/ with the same layout.
+fn powsm_files() -> [(String, &'static str); 4] {
+    [
+        (
+            "exp/s2t_stats_raw_bpe40000/train/feats_stats.npz".into(),
+            "f3ca2ef68be502a75a646c8da36847375964a0d6499fd9ee2d7d620a0f31d746",
+        ),
+        (
+            "data/token_list/bpe_unigram40000/bpe.model".into(),
+            "9b9a8b76353430d41a1b8f7f2ec0f40fa8c4e75567eaef6887bdbb893c55236a",
+        ),
+        (
+            format!("{POWSM_EXP}/config.yaml"),
+            "f29993179ff12d9f082052c8e1ccbe192c26f6bfe116cc53d6422c5c8012787b",
+        ),
+        (
+            format!("{POWSM_EXP}/valid.acc.ave_5best.till45epoch.pth"),
+            "a91a03bcfd59a956319939891c4098e8f7e8c9ea568d7ec2bcbc1131b32d1197",
+        ),
+    ]
+}
+
+fn ipa_dir() -> PathBuf {
+    util::data_dir().join("ipa")
+}
+
+fn ipa_python() -> PathBuf {
+    ipa_dir().join("venv").join("Scripts").join("python.exe")
+}
+
+/// Is the Python/PyTorch/ESPnet runtime installed?
+pub fn ipa_runtime_ready() -> bool {
+    ipa_dir().join(IPA_MARK).exists() && ipa_python().exists()
+}
+
+/// Are the POWSM model files present in `models_dir`?
+pub fn powsm_model_ready(models_dir: &Path) -> bool {
+    powsm_files().iter().all(|(p, _)| models_dir.join("powsm").join(p).exists())
+}
+
+/// Removes only the files SimpleSTT itself put in the models folder (never the user's other files).
+pub fn powsm_remove(models_dir: &Path) {
+    for (p, _) in powsm_files() {
+        let _ = std::fs::remove_file(models_dir.join("powsm").join(&p));
+        let _ = std::fs::remove_file(models_dir.join("powsm").join(format!("{p}.part")));
+    }
+    // prune now-empty folders (remove_dir fails on non-empty ones, which keeps anything else there)
+    for sub in [
+        POWSM_EXP,
+        "exp/s2t_stats_raw_bpe40000/train",
+        "exp/s2t_stats_raw_bpe40000",
+        "exp",
+        "data/token_list/bpe_unigram40000",
+        "data/token_list",
+        "data",
+        "",
+    ] {
+        let _ = std::fs::remove_dir(models_dir.join("powsm").join(sub));
+    }
+}
+
+fn dir_size(p: &Path) -> u64 {
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            match e.metadata() {
+                Ok(m) if m.is_dir() => n += dir_size(&e.path()),
+                Ok(m) => n += m.len(),
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
+fn unzip(zip: &Path, dest: &Path) -> bool {
+    let tar = std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
+        .unwrap_or_else(|| PathBuf::from("tar.exe"));
+    Command::new(tar)
+        .arg("-xf")
+        .arg(zip)
+        .arg("-C")
+        .arg(dest)
+        .creation_flags(0x0800_0000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Runs a helper (uv / python) hidden, logging to ipa\install.log, killing it if the setup is cancelled.
+/// While it runs, the ipa folder's growth drives the progress ring (`expect` bytes = 100 %).
+fn run_tool(gen: u32, mut cmd: Command, label: &str, expect: u64) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(ipa_dir().join("install.log")).ok();
+    let (out, err) = match log.as_ref().and_then(|f| Some((f.try_clone().ok()?, f.try_clone().ok()?))) {
+        Some((a, b)) => (Stdio::from(a), Stdio::from(b)),
+        None => (Stdio::null(), Stdio::null()),
+    };
+    let dir = ipa_dir();
+    cmd.env("UV_PYTHON_INSTALL_DIR", dir.join("python"))
+        .env("UV_CACHE_DIR", dir.join("uvcache"))
+        .env("UV_PYTHON_PREFERENCE", "only-managed")
+        .env("UV_LINK_MODE", "copy")
+        .env("UV_NO_PROGRESS", "1")
+        .env("NLTK_DATA", dir.join("nltk_data"))
+        .env("PYTHONUTF8", "1")
+        .creation_flags(0x0800_0000)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    let mut child = cmd.spawn().map_err(|e| format!("{label}: {e}"))?;
+    unsafe { AssignProcessToJobObject(job() as _, child.as_raw_handle() as _) };
+    let mut tick = 0u32;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) if st.success() => return Ok(()),
+            Ok(Some(_)) => return Err(format!("{label} failed — see ipa\\install.log")),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if stale(gen) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("cancelled".into());
+        }
+        if tick % 4 == 0 && expect > 0 {
+            let p = ((dir_size(&dir) * 1000 / expect) as i32).min(990);
+            PROGRESS.store(p, Relaxed);
+            setup_status(gen, &format!("{label} {}%", p / 10));
+        }
+        tick += 1;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn install_ipa_runtime(gen: u32) -> Result<(), String> {
+    let dir = ipa_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let uv = dir.join("uv").join("uv.exe");
+    if !uv.exists() {
+        let zip = dir.join("uv.zip");
+        dl(gen, UV_URL, &zip, "Downloading installer")?;
+        if util::sha256_file(&zip).unwrap_or_default() != UV_SHA {
+            let _ = std::fs::remove_file(&zip);
+            return Err("Installer download was corrupt — click to retry".into());
+        }
+        let tmp = dir.join("uv.tmp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+        if !unzip(&zip, &tmp) || !tmp.join("uv.exe").exists() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err("Couldn't unpack the installer".into());
+        }
+        let _ = std::fs::remove_dir_all(dir.join("uv"));
+        std::fs::rename(&tmp, dir.join("uv")).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&zip);
+    }
+    let gpu = has_nvidia();
+    // peak size of cache + environment while installing (wheels are cached, then extracted)
+    let expect: u64 = (if gpu { IPA_RUNTIME_MB } else { IPA_RUNTIME_CPU_MB } as u64) * 1_048_576 * 17 / 10;
+    let venv = dir.join("venv");
+    let py = ipa_python();
+
+    PROGRESS.store(-1, Relaxed);
+    setup_status(gen, "Installing Python…");
+    let mut c = Command::new(&uv);
+    c.args(["venv", "--python", "3.11"]).arg(&venv);
+    run_tool(gen, c, "Installing Python", 0)?;
+
+    let index = if gpu {
+        "https://download.pytorch.org/whl/cu128"
+    } else {
+        "https://download.pytorch.org/whl/cpu"
+    };
+    let mut c = Command::new(&uv);
+    c.args(["pip", "install", "--python"])
+        .arg(&py)
+        .args(["torch==2.11.0", "torchaudio==2.11.0", "--index-url", index]);
+    run_tool(gen, c, if gpu { "Installing PyTorch (GPU)" } else { "Installing PyTorch" }, expect)?;
+
+    let mut c = Command::new(&uv);
+    c.args(["pip", "install", "--python"]).arg(&py).args(["espnet==202511"]);
+    run_tool(gen, c, "Installing ESPnet", expect)?;
+
+    // import once: fetches ESPnet's small NLTK data into our own folder and proves the install works
+    PROGRESS.store(-1, Relaxed);
+    setup_status(gen, "Checking IPA runtime…");
+    let mut c = Command::new(&py);
+    c.args(["-c", "import torch, espnet2.bin.s2t_inference"]);
+    run_tool(gen, c, "Checking IPA runtime", 0)?;
+
+    let _ = std::fs::remove_dir_all(dir.join("uvcache")); // wheels are only needed during install
+    std::fs::write(dir.join(IPA_MARK), "").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn ensure_powsm(gen: u32, cfg: &Config) -> Result<PathBuf, String> {
+    let root = cfg.models_dir.join("powsm");
+    for (path, sha) in powsm_files() {
+        let dest = root.join(&path);
+        if dest.exists() {
+            continue;
+        }
+        if !IPA_CONSENT.load(Relaxed) {
+            return Err("IPA model missing — pick it again in settings to download".into());
+        }
+        PROGRESS.store(0, Relaxed);
+        let url = format!("https://huggingface.co/espnet/powsm/resolve/{POWSM_REV}/{path}");
+        dl(gen, &url, &dest, "Downloading IPA model")?;
+        PROGRESS.store(-1, Relaxed);
+        if util::sha256_file(&dest).unwrap_or_default() != sha {
+            let _ = std::fs::remove_file(&dest);
+            return Err("IPA model download was corrupt — click to retry".into());
+        }
+    }
+    Ok(root)
+}
+
+/// POWSM wants ISO 639-3 language tokens; map the common 2-letter codes, pass 3-letter ones through,
+/// and use <unk> (language-independent) for "auto" and anything unknown.
+fn ipa_lang(l: &str) -> String {
+    let l = l.trim().to_lowercase();
+    let three = match l.as_str() {
+        "auto" | "" => "unk",
+        "en" => "eng",
+        "de" => "deu",
+        "fr" => "fra",
+        "es" => "spa",
+        "it" => "ita",
+        "pt" => "por",
+        "nl" => "nld",
+        "ru" => "rus",
+        "ja" => "jpn",
+        "zh" => "cmn",
+        "ko" => "kor",
+        "ar" => "arb",
+        "hi" => "hin",
+        "tr" => "tur",
+        "pl" => "pol",
+        "sv" => "swe",
+        "da" => "dan",
+        "no" => "nob",
+        "fi" => "fin",
+        "cs" => "ces",
+        "el" => "ell",
+        "he" => "heb",
+        "uk" => "ukr",
+        "vi" => "vie",
+        "id" => "ind",
+        "th" => "tha",
+        x if x.len() == 3 => x,
+        _ => "unk",
+    };
+    format!("<{three}>")
+}
+
+fn launch_ipa(root: &Path, cfg: &Config, gen: u32) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+    let dir = ipa_dir();
+    let script = dir.join("ipa_server.py");
+    std::fs::write(&script, include_str!("../assets/ipa_server.py")).map_err(|e| e.to_string())?;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map_err(|e| e.to_string())?
+        .port();
+    PORT.store(port, Relaxed);
+    let child = Command::new(ipa_python())
+        .arg(&script)
+        .arg("--root")
+        .arg(root)
+        .args(["--port", &port.to_string(), "--lang", &ipa_lang(&cfg.lang)])
+        .current_dir(&dir)
+        .env("NLTK_DATA", dir.join("nltk_data"))
+        .env("CUDA_CACHE_PATH", util::data_dir().join("cudacache"))
+        .env("CUDA_CACHE_MAXSIZE", "4294967296")
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONUNBUFFERED", "1")
+        .creation_flags(0x0800_0000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Couldn't start IPA engine: {e}"))?;
+    unsafe { AssignProcessToJobObject(job() as _, child.as_raw_handle() as _) };
+    *SERVER.lock().unwrap() = Some(child);
+    setup_status(gen, "Loading IPA model…");
+    wait_ready(port, gen, "IPA engine crashed on start")
+}
+
+fn setup_ipa(cfg: &Config, gen: u32) -> Result<(), String> {
+    if !ipa_runtime_ready() {
+        if !IPA_CONSENT.load(Relaxed) {
+            return Err("IPA needs an extra download — pick it again in settings".into());
+        }
+        install_ipa_runtime(gen)?;
+    }
+    let root = ensure_powsm(gen, cfg)?;
+    PROGRESS.store(-1, Relaxed);
+    launch_ipa(&root, cfg, gen)?;
+    setup_status(gen, "Warming up GPU…");
+    transcribe_raw(&vec![0i16; 16000], Duration::from_secs(900))?;
+    if !stale(gen) {
+        READY.store(true, Relaxed);
+        setup_status(gen, "Ready (IPA) — click the mic");
+        util::refresh();
+    }
+    Ok(())
 }

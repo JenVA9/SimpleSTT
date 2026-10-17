@@ -609,12 +609,51 @@ unsafe fn get_text(h: HWND) -> String {
     from_wide(&b)
 }
 
+fn fmt_mb(mb: u32) -> String {
+    if mb >= 1000 { format!("{:.1} GB", mb as f32 / 1024.0) } else { format!("{mb} MB") }
+}
+
+/// The IPA model needs a separate Python/PyTorch runtime. Nothing is downloaded until the user says yes here.
+unsafe fn confirm_ipa_download(owner: HWND, models_dir: &Path) -> bool {
+    let mut parts: Vec<String> = Vec::new();
+    let mut mb = 0u32;
+    let mut peak = 0u32; // wheels are cached while installing, then the cache is deleted
+    if !engine::ipa_runtime_ready() {
+        let (r, kind) = if engine::has_nvidia() {
+            (engine::IPA_RUNTIME_MB, "CUDA GPU build")
+        } else {
+            (engine::IPA_RUNTIME_CPU_MB, "CPU build")
+        };
+        mb += r;
+        peak += r * 2;
+        parts.push(format!("  •  Python + PyTorch ({kind}) + ESPnet runtime: about {}\n      → {}\\ipa", fmt_mb(r), util::data_dir().display()));
+    }
+    if !engine::powsm_model_ready(models_dir) {
+        mb += 1311;
+        peak += 1311;
+        parts.push(format!("  •  POWSM model: about 1.3 GB\n      → {}\\powsm", models_dir.display()));
+    }
+    let text = format!(
+        "IPA mode needs extra components that normal dictation doesn't use:\n\n{}\n\nTotal download: about {} (needs up to {} of free disk space while installing). This can take 10+ minutes. Nothing is installed until you click Yes, and \"Delete all data…\" removes it again.\n\nDownload and install now?",
+        parts.join("\n"),
+        fmt_mb(mb),
+        fmt_mb(peak)
+    );
+    MessageBoxW(owner, w(&text).as_ptr(), w("IPA mode: extra download").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
+}
+
 unsafe fn fill_combo(cb: HWND, dir: &Path, sel: &str) {
     SendMessageW(cb, CB_RESETCONTENT, 0, 0);
     for (i, (n, mb)) in MODELS.iter().enumerate() {
-        let size = if *mb >= 1000 { format!("{:.1} GB", *mb as f32 / 1024.0) } else { format!("{mb} MB") };
-        let have = if engine::model_path_in(dir, n).exists() { "   ✓ downloaded" } else { "" };
-        SendMessageW(cb, CB_ADDSTRING, 0, w(&format!("{n}  —  {size}{have}")).as_ptr() as isize);
+        let size = fmt_mb(*mb);
+        let label = if engine::is_ipa(n) {
+            let have = if engine::ipa_runtime_ready() && engine::powsm_model_ready(dir) { "   ✓ ready" } else { "" };
+            format!("{n}  —  IPA phones (POWSM) · {size} + extra runtime{have}")
+        } else {
+            let have = if engine::model_path_in(dir, n).exists() { "   ✓ downloaded" } else { "" };
+            format!("{n}  —  {size}{have}")
+        };
+        SendMessageW(cb, CB_ADDSTRING, 0, w(&label).as_ptr() as isize);
         if *n == sel {
             SendMessageW(cb, CB_SETCURSEL, i, 0);
         }
@@ -644,6 +683,7 @@ fn wipe(models_dir: &Path) {
     let dd = util::data_dir();
     if !models_dir.starts_with(&dd) {
         // custom folder: delete only the files we created there, never the user's other files
+        engine::powsm_remove(models_dir);
         if let Ok(rd) = std::fs::read_dir(models_dir) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_lowercase();
@@ -717,10 +757,19 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         lang: if lang.is_empty() { "auto".into() } else { lang },
                         desktop: old.desktop, // toggled on the main window
                     };
-                    if new != old {
+                    // IPA needs a separate runtime: ask first, install nothing without a yes
+                    let need_ipa = engine::is_ipa(&new.model)
+                        && !(engine::ipa_runtime_ready() && engine::powsm_model_ready(&new.models_dir));
+                    if need_ipa {
+                        if !confirm_ipa_download(hwnd, &new.models_dir) {
+                            return 0; // stay in settings; nothing saved, nothing downloaded
+                        }
+                        engine::IPA_CONSENT.store(true, Relaxed);
+                    }
+                    if new != old || need_ipa {
                         new.save();
                         *CFG.lock().unwrap() = Some(new.clone());
-                        if !new.engine_differs(&old) {
+                        if !(new.engine_differs(&old) || need_ipa) {
                         } else if STATE.load(Relaxed) == IDLE {
                             engine::start_setup(new);
                         } else {
@@ -742,11 +791,16 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let text = w("This deletes the speech engine, every downloaded model, and all settings, then closes SimpleSTT.\n\nSimpleSTT.exe itself is not touched — delete it yourself afterwards.\n\nContinue?");
                     let ok = MessageBoxW(hwnd, text.as_ptr(), w("Delete all SimpleSTT data").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
                     if ok == IDYES {
+                        // deleting a multi-GB runtime takes a while: do it off the UI thread, then close
                         let dir = cfg().models_dir;
-                        wipe(&dir);
                         let main = util::main_hwnd();
-                        DestroyWindow(hwnd);
-                        DestroyWindow(main);
+                        DestroyWindow(hwnd); // re-enables the main window...
+                        EnableWindow(main, 0); // ...so lock it again while we delete
+                        engine::set_status("Deleting everything…", false);
+                        std::thread::spawn(move || {
+                            wipe(&dir);
+                            unsafe { PostMessageW(util::main_hwnd(), WM_CLOSE, 0, 0) };
+                        });
                     }
                 }
                 _ => {}
