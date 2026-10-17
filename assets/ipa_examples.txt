@@ -1,0 +1,14 @@
+IPA: pʰliːzsɛ̃ntmiðəɹɪpɔɹtbɪfɔɹfɹaɪdeɪæftə˞nun
+OUT: Please send me the report before Friday afternoon.
+IPA: viːɐtʁɛfənʊnsmɔʁɡənʊmaχtuːɐfoːɐdeːmkiːnoː
+OUT: Wir treffen uns morgen um acht Uhr vor dem Kino.
+IPA: meɣustaɾiaɾeseɾβaɾunamesapaɾakwatɾopeɾsonas
+OUT: Me gustaría reservar una mesa para cuatro personas.
+IPA: nuzalɔ̃omaʁʃesamdimatɛ̃puʁaʃtedypɛ̃
+OUT: Nous allons au marché samedi matin pour acheter du pain.
+IPA: asɯwaameɡafɯɾɯsoːdesɯ
+OUT: 明日は雨が降るそうです。
+IPA: aɪwɪlkɔːljuːtəmɒɹoʊɑːbɐhɔɪtəɑːbn̩thaːbəɪçkaɪnətsaɪt
+OUT: I will call you tomorrow, aber heute Abend habe ich keine Zeit.
+IPA: ʋəɣaːnmɔrɣənaːrətstrɑntɑlshətʋeːrɣutɪs
+OUT: We gaan morgen naar het strand als het weer goed is.

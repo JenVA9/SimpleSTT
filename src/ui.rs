@@ -1,10 +1,10 @@
 //! The whole UI: a tiny custom-drawn window (mic button + settings gear) and a native settings window.
 //! Raw Win32 + GDI+ (anti-aliased shapes); no UI framework, so the binary stays tiny.
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering::*};
-use std::sync::{Mutex, Once, OnceLock, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -13,18 +13,17 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Graphics::GdiPlus::*;
-use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree};
+use windows_sys::Win32::System::Com::CoInitializeEx;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
-use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use std::result::Result::{Err, Ok}; // GDI+ also exports an `Ok` status constant; keep Result's.
 
-use crate::engine::{self, Config, DONE, IDLE, MODELS, REC, STATE, TRANS};
+use crate::engine::{self, Config, DONE, IDLE, REC, STATE, TRANS};
 use crate::util::{self, WM_REFRESH, WM_RESULT, from_wide, w};
 use crate::live::{self, Live};
-use crate::{audio, update};
+use crate::{audio, dialogs, update};
 
 // ---- layout (96-dpi units) ---------------------------------------------------------------------
 const W: i32 = 220;
@@ -58,7 +57,6 @@ static DPI: AtomicU32 = AtomicU32::new(96);
 static HOVER: AtomicU8 = AtomicU8::new(0);
 static TRACKING: AtomicBool = AtomicBool::new(false);
 static TIMER_ON: AtomicBool = AtomicBool::new(false);
-static SETTINGS: AtomicIsize = AtomicIsize::new(0);
 static F_TEXT: AtomicIsize = AtomicIsize::new(0);
 static F_MIC: AtomicIsize = AtomicIsize::new(0);
 static F_GEAR: AtomicIsize = AtomicIsize::new(0);
@@ -71,13 +69,13 @@ static REC_STOP: AtomicBool = AtomicBool::new(false);
 type RecJob = (JoinHandle<()>, JoinHandle<Result<String, String>>);
 static REC_JOB: Mutex<Option<RecJob>> = Mutex::new(None);
 
-fn s(x: i32) -> i32 {
+pub(crate) fn s(x: i32) -> i32 {
     x * DPI.load(Relaxed) as i32 / 96
 }
 fn sf(x: f32) -> f32 {
     x * DPI.load(Relaxed) as f32 / 96.0
 }
-fn cfg() -> Config {
+pub(crate) fn cfg() -> Config {
     CFG.lock().unwrap().clone().unwrap()
 }
 
@@ -105,7 +103,12 @@ pub fn run() {
         F_GEAR.store(make_font(icons, 17, 400) as isize, Relaxed);
         F_VER.store(make_font("Segoe UI", 10, 400) as isize, Relaxed);
 
-        let c = Config::load();
+        let mut c = Config::load();
+        // a copy that was just self-updated is by definition an existing install: never show it the wizard
+        if std::env::args().any(|a| a == "--relaunch") && !c.onboarded {
+            c.onboarded = true;
+            c.save();
+        }
         DESKTOP.store(c.desktop, Relaxed);
         *CFG.lock().unwrap() = Some(c);
 
@@ -150,12 +153,18 @@ pub fn run() {
         DwmSetWindowAttribute(hwnd, 20, &dark as *const i32 as *const c_void, 4);
         ShowWindow(hwnd, SW_SHOW);
 
-        engine::start_setup(cfg());
+        if cfg().onboarded {
+            engine::start_setup(cfg());
+        } else {
+            // brand-new install: nothing is downloaded until the wizard finishes (its Finish starts the setup)
+            engine::set_status("Welcome — quick setup…", false);
+            dialogs::open_wizard(hwnd);
+        }
         update::spawn();
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            let sh = SETTINGS.load(Relaxed) as HWND;
+            let sh = dialogs::active_dialog();
             if !sh.is_null() && IsDialogMessageW(sh, &msg) != 0 {
                 continue;
             }
@@ -166,7 +175,7 @@ pub fn run() {
     }
 }
 
-unsafe fn make_font(face: &str, px: i32, weight: i32) -> HFONT {
+pub(crate) unsafe fn make_font(face: &str, px: i32, weight: i32) -> HFONT {
     CreateFontW(-s(px), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, w(face).as_ptr())
 }
 
@@ -189,6 +198,9 @@ fn idle(msg: &str, bad: bool) {
 }
 
 fn toggle_mic() {
+    if !cfg().onboarded {
+        return; // first-run wizard still open
+    }
     match STATE.load(Relaxed) {
         REC => stop_rec(),
         TRANS => {}
@@ -484,7 +496,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_LBUTTONUP => {
             match hit(lo(lp), hi(lp)) {
                 1 => toggle_mic(),
-                2 => open_settings(hwnd),
+                2 => dialogs::open_settings(hwnd),
                 3 => toggle_desktop(),
                 _ => {}
             }
@@ -538,289 +550,24 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
 }
 
-// ---- settings window --------------------------------------------------------------------------
-const ID_DIR: i32 = 101;
-const ID_BROWSE: i32 = 102;
-const ID_MODEL: i32 = 103;
-const ID_LANG: i32 = 104;
-const ID_DELETE: i32 = 107;
 
-unsafe fn open_settings(parent: HWND) {
-    let existing = SETTINGS.load(Relaxed) as HWND;
-    if !existing.is_null() {
-        SetForegroundWindow(existing);
+/// Saves `new`, makes it the live config and (when `restart`) restarts the engine(s) with it —
+/// immediately if idle, otherwise once the current dictation is over.
+pub(crate) fn apply_config(new: Config, restart: bool) {
+    new.save();
+    DESKTOP.store(new.desktop, Relaxed);
+    *CFG.lock().unwrap() = Some(new.clone());
+    if !restart {
         return;
     }
-    static REG: Once = Once::new();
-    let hinst = GetModuleHandleW(null());
-    let cls = w("SimpleSTTSettings");
-    REG.call_once(|| {
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(settings_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinst,
-            hIcon: null_mut(),
-            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_BTNFACE + 1) as HBRUSH,
-            lpszMenuName: null(),
-            lpszClassName: cls.as_ptr(),
-        };
-        RegisterClassW(&wc);
-    });
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    let mut r = RECT { left: 0, top: 0, right: s(460), bottom: s(300) };
-    AdjustWindowRectEx(&mut r, style, 0, 0);
-    let (ww, wh) = (r.right - r.left, r.bottom - r.top);
-    let mut pr: RECT = std::mem::zeroed();
-    GetWindowRect(parent, &mut pr);
-    let x = (pr.left + pr.right - ww) / 2;
-    let y = (pr.top + pr.bottom - wh) / 2;
-    let h = CreateWindowExW(0, cls.as_ptr(), w("SimpleSTT settings").as_ptr(), style, x, y, ww, wh, parent, null_mut(), hinst, null());
-    SETTINGS.store(h as isize, Relaxed);
-    EnableWindow(parent, 0);
-    ShowWindow(h, SW_SHOW);
-}
-
-unsafe fn ctl(parent: HWND, class: &str, text: &str, style: u32, x: i32, y: i32, wd: i32, ht: i32, id: i32) -> HWND {
-    let h = CreateWindowExW(
-        0,
-        w(class).as_ptr(),
-        w(text).as_ptr(),
-        WS_CHILD | WS_VISIBLE | style,
-        s(x),
-        s(y),
-        s(wd),
-        s(ht),
-        parent,
-        id as isize as HMENU,
-        GetModuleHandleW(null()),
-        null(),
-    );
-    SendMessageW(h, WM_SETFONT, F_UI.load(Relaxed) as usize, 1);
-    h
-}
-static F_UI: AtomicIsize = AtomicIsize::new(0);
-
-unsafe fn get_text(h: HWND) -> String {
-    let mut b = [0u16; 1024];
-    GetWindowTextW(h, b.as_mut_ptr(), 1024);
-    from_wide(&b)
-}
-
-fn fmt_mb(mb: u32) -> String {
-    if mb >= 1000 { format!("{:.1} GB", mb as f32 / 1024.0) } else { format!("{mb} MB") }
-}
-
-/// The IPA model needs a separate Python/PyTorch runtime. Nothing is downloaded until the user says yes here.
-unsafe fn confirm_ipa_download(owner: HWND, models_dir: &Path) -> bool {
-    let mut parts: Vec<String> = Vec::new();
-    let mut mb = 0u32;
-    let mut peak = 0u32; // wheels are cached while installing, then the cache is deleted
-    if !engine::ipa_runtime_ready() {
-        let (r, kind) = if engine::has_nvidia() {
-            (engine::IPA_RUNTIME_MB, "CUDA GPU build")
-        } else {
-            (engine::IPA_RUNTIME_CPU_MB, "CPU build")
-        };
-        mb += r;
-        peak += r * 2;
-        parts.push(format!("  •  Python + PyTorch ({kind}) + ESPnet runtime: about {}\n      → {}\\ipa", fmt_mb(r), util::data_dir().display()));
-    }
-    if !engine::powsm_model_ready(models_dir) {
-        mb += 1311;
-        peak += 1311;
-        parts.push(format!("  •  POWSM model: about 1.3 GB\n      → {}\\powsm", models_dir.display()));
-    }
-    let text = format!(
-        "IPA mode needs extra components that normal dictation doesn't use:\n\n{}\n\nTotal download: about {} (needs up to {} of free disk space while installing). This can take 10+ minutes. Nothing is installed until you click Yes, and \"Delete all data…\" removes it again.\n\nDownload and install now?",
-        parts.join("\n"),
-        fmt_mb(mb),
-        fmt_mb(peak)
-    );
-    MessageBoxW(owner, w(&text).as_ptr(), w("IPA mode: extra download").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
-}
-
-unsafe fn fill_combo(cb: HWND, dir: &Path, sel: &str) {
-    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
-    for (i, (n, mb)) in MODELS.iter().enumerate() {
-        let size = fmt_mb(*mb);
-        let label = if engine::is_ipa(n) {
-            let have = if engine::ipa_runtime_ready() && engine::powsm_model_ready(dir) { "   ✓ ready" } else { "" };
-            format!("{n}  —  IPA phones (POWSM) · {size} + extra runtime{have}")
-        } else {
-            let have = if engine::model_path_in(dir, n).exists() { "   ✓ downloaded" } else { "" };
-            format!("{n}  —  {size}{have}")
-        };
-        SendMessageW(cb, CB_ADDSTRING, 0, w(&label).as_ptr() as isize);
-        if *n == sel {
-            SendMessageW(cb, CB_SETCURSEL, i, 0);
-        }
-    }
-}
-
-unsafe fn browse(owner: HWND) -> Option<PathBuf> {
-    let mut bi: BROWSEINFOW = std::mem::zeroed();
-    bi.hwndOwner = owner;
-    let title = w("Choose where to store Whisper models");
-    bi.lpszTitle = title.as_ptr();
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    let pidl = SHBrowseForFolderW(&bi);
-    if pidl.is_null() {
-        return None;
-    }
-    let mut b = [0u16; 520];
-    let ok = SHGetPathFromIDListW(pidl, b.as_mut_ptr()) != 0;
-    CoTaskMemFree(pidl as *const c_void);
-    ok.then(|| PathBuf::from(from_wide(&b)))
-}
-
-/// Removes everything SimpleSTT put on disk (engine, models, settings, caches).
-fn wipe(models_dir: &Path) {
-    engine::cancel();
-    std::thread::sleep(Duration::from_millis(400));
-    let dd = util::data_dir();
-    if !models_dir.starts_with(&dd) {
-        // custom folder: delete only the files we created there, never the user's other files
-        engine::powsm_remove(models_dir);
-        if let Ok(rd) = std::fs::read_dir(models_dir) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_lowercase();
-                if n.starts_with("ggml-") && (n.ends_with(".bin") || n.ends_with(".bin.part")) {
-                    let _ = std::fs::remove_file(e.path());
-                }
+    if STATE.load(Relaxed) == IDLE {
+        engine::start_setup(new);
+    } else {
+        std::thread::spawn(move || {
+            while STATE.load(Relaxed) == REC || STATE.load(Relaxed) == TRANS {
+                std::thread::sleep(Duration::from_millis(300));
             }
-        }
-        let _ = std::fs::remove_dir(models_dir);
-    }
-    for _ in 0..10 {
-        if std::fs::remove_dir_all(&dd).is_ok() || !dd.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
-        let _ = std::fs::remove_file(exe.with_extension("exe.new"));
-    }
-}
-
-unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match msg {
-        WM_CREATE => {
-            let f = make_font("Segoe UI", 12, 400);
-            F_UI.store(f as isize, Relaxed);
-            let c = cfg();
-            const EDIT: u32 = WS_TABSTOP | WS_BORDER | 0x80; // ES_AUTOHSCROLL
-            const BTN: u32 = WS_TABSTOP;
-            ctl(hwnd, "STATIC", "Models folder", 0, 16, 14, 428, 18, 0);
-            ctl(hwnd, "EDIT", &c.models_dir.to_string_lossy(), EDIT, 16, 34, 340, 24, ID_DIR);
-            ctl(hwnd, "BUTTON", "Browse…", BTN, 364, 33, 80, 26, ID_BROWSE);
-            ctl(hwnd, "STATIC", "Model  (downloaded automatically when selected)", 0, 16, 74, 428, 18, 0);
-            let cb = ctl(hwnd, "COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | 3 /* CBS_DROPDOWNLIST */, 16, 94, 428, 300, ID_MODEL);
-            fill_combo(cb, &c.models_dir, &c.model);
-            ctl(hwnd, "STATIC", "Language  (auto, en, de, fr, es, … — .en models always use English)", 0, 16, 134, 428, 18, 0);
-            ctl(hwnd, "EDIT", &c.lang, EDIT, 16, 154, 120, 24, ID_LANG);
-            let dd = format!("Engine, cache and settings live in:\n{}", util::data_dir().display());
-            ctl(hwnd, "STATIC", &dd, 0, 16, 196, 428, 36, 0);
-            ctl(hwnd, "BUTTON", "Delete all data…", BTN, 16, 252, 130, 30, ID_DELETE);
-            ctl(hwnd, "BUTTON", "Save", BTN | 1 /* BS_DEFPUSHBUTTON */, 274, 252, 80, 30, 1);
-            ctl(hwnd, "BUTTON", "Cancel", BTN, 364, 252, 80, 30, 2);
-            0
-        }
-        WM_COMMAND => {
-            let id = (wp & 0xffff) as i32;
-            let code = ((wp >> 16) & 0xffff) as u32;
-            let dir_h = GetDlgItem(hwnd, ID_DIR);
-            let cb = GetDlgItem(hwnd, ID_MODEL);
-            match id {
-                ID_BROWSE => {
-                    if let Some(p) = browse(hwnd) {
-                        SetWindowTextW(dir_h, w(&p.to_string_lossy()).as_ptr());
-                        let i = SendMessageW(cb, CB_GETCURSEL, 0, 0).max(0) as usize;
-                        fill_combo(cb, &p, MODELS[i.min(MODELS.len() - 1)].0);
-                    }
-                }
-                ID_DIR if code == EN_KILLFOCUS as u32 => {
-                    let i = SendMessageW(cb, CB_GETCURSEL, 0, 0).max(0) as usize;
-                    fill_combo(cb, Path::new(&get_text(dir_h)), MODELS[i.min(MODELS.len() - 1)].0);
-                }
-                1 => {
-                    let old = cfg();
-                    let dir = get_text(dir_h);
-                    let lang = get_text(GetDlgItem(hwnd, ID_LANG)).trim().to_lowercase();
-                    let i = SendMessageW(cb, CB_GETCURSEL, 0, 0).max(0) as usize;
-                    let new = Config {
-                        models_dir: if dir.trim().is_empty() { old.models_dir.clone() } else { PathBuf::from(dir.trim()) },
-                        model: MODELS[i.min(MODELS.len() - 1)].0.to_string(),
-                        lang: if lang.is_empty() { "auto".into() } else { lang },
-                        desktop: old.desktop, // toggled on the main window
-                    };
-                    // IPA needs a separate runtime: ask first, install nothing without a yes
-                    let need_ipa = engine::is_ipa(&new.model)
-                        && !(engine::ipa_runtime_ready() && engine::powsm_model_ready(&new.models_dir));
-                    if need_ipa {
-                        if !confirm_ipa_download(hwnd, &new.models_dir) {
-                            return 0; // stay in settings; nothing saved, nothing downloaded
-                        }
-                        engine::IPA_CONSENT.store(true, Relaxed);
-                    }
-                    if new != old || need_ipa {
-                        new.save();
-                        *CFG.lock().unwrap() = Some(new.clone());
-                        if !(new.engine_differs(&old) || need_ipa) {
-                        } else if STATE.load(Relaxed) == IDLE {
-                            engine::start_setup(new);
-                        } else {
-                            // mid-dictation: apply once the user is done
-                            std::thread::spawn(move || {
-                                while STATE.load(Relaxed) == REC || STATE.load(Relaxed) == TRANS {
-                                    std::thread::sleep(Duration::from_millis(300));
-                                }
-                                engine::start_setup(new);
-                            });
-                        }
-                    }
-                    DestroyWindow(hwnd);
-                }
-                2 => {
-                    DestroyWindow(hwnd);
-                }
-                ID_DELETE => {
-                    let text = w("This deletes the speech engine, every downloaded model, and all settings, then closes SimpleSTT.\n\nSimpleSTT.exe itself is not touched — delete it yourself afterwards.\n\nContinue?");
-                    let ok = MessageBoxW(hwnd, text.as_ptr(), w("Delete all SimpleSTT data").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
-                    if ok == IDYES {
-                        // deleting a multi-GB runtime takes a while: do it off the UI thread, then close
-                        let dir = cfg().models_dir;
-                        let main = util::main_hwnd();
-                        DestroyWindow(hwnd); // re-enables the main window...
-                        EnableWindow(main, 0); // ...so lock it again while we delete
-                        engine::set_status("Deleting everything…", false);
-                        std::thread::spawn(move || {
-                            wipe(&dir);
-                            unsafe { PostMessageW(util::main_hwnd(), WM_CLOSE, 0, 0) };
-                        });
-                    }
-                }
-                _ => {}
-            }
-            0
-        }
-        WM_CLOSE => {
-            DestroyWindow(hwnd);
-            0
-        }
-        WM_DESTROY => {
-            SETTINGS.store(0, Relaxed);
-            DeleteObject(F_UI.load(Relaxed) as HFONT);
-            let main = util::main_hwnd();
-            if IsWindow(main) != 0 {
-                EnableWindow(main, 1);
-                SetForegroundWindow(main);
-            }
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
+            engine::start_setup(new);
+        });
     }
 }

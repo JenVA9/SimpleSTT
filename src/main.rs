@@ -1,8 +1,10 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod dialogs;
 mod engine;
 mod live;
+mod llm;
 mod loopback;
 mod net;
 mod ui;

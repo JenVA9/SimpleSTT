@@ -33,6 +33,8 @@ static SERVER: Mutex<Option<Child>> = Mutex::new(None);
 static SETUP_LOCK: Mutex<()> = Mutex::new(());
 /// true while the loaded engine is the IPA (POWSM) python server instead of whisper-server
 static IPA: AtomicBool = AtomicBool::new(false);
+/// IPA mode: pass the phones through the text model (Gemma) to get written text
+static IPA_AI: AtomicBool = AtomicBool::new(false);
 /// Set by the UI once the user accepted the "extra download" warning. Without it, setup refuses to fetch
 /// the IPA runtime/model, so a stray config edit can never trigger a multi-GB download.
 pub static IPA_CONSENT: AtomicBool = AtomicBool::new(false);
@@ -50,7 +52,7 @@ pub fn set_status(s: &str, bad: bool) {
 }
 
 /// Status updates from the background setup only show while idle and while still current.
-fn setup_status(gen: u32, s: &str) {
+pub(crate) fn setup_status(gen: u32, s: &str) {
     if GEN.load(Relaxed) == gen && STATE.load(Relaxed) == IDLE {
         set_status(s, false);
     }
@@ -79,6 +81,9 @@ pub fn is_ipa(model: &str) -> bool {
     model == IPA_MODEL
 }
 
+/// Model name meaning "use the file in `custom_model` / `custom_text`" (any ggml .bin / .gguf the user picked).
+pub const CUSTOM: &str = "custom";
+
 #[derive(Clone, PartialEq)]
 pub struct Config {
     pub models_dir: PathBuf,
@@ -86,13 +91,36 @@ pub struct Config {
     pub lang: String,
     /// also capture what the PC is playing (calls, videos) and mix it with the mic
     pub desktop: bool,
+    /// IPA mode only: where the text (Gemma) models live, which one, and whether to use it at all
+    pub text_dir: PathBuf,
+    pub text_model: String,
+    pub ipa_ai: bool,
+    /// user-picked model files for model == CUSTOM / text_model == CUSTOM
+    pub custom_model: PathBuf,
+    pub custom_text: PathBuf,
+    /// false until the first-run wizard has been completed (never shown to existing installs)
+    pub onboarded: bool,
 }
 
 impl Config {
-    /// Settings that require restarting the whisper server when changed.
+    /// Settings that require restarting the engine(s) when changed.
     pub fn engine_differs(&self, o: &Config) -> bool {
-        self.models_dir != o.models_dir || self.model != o.model || self.lang != o.lang
+        self.models_dir != o.models_dir
+            || self.model != o.model
+            || self.lang != o.lang
+            || self.custom_model != o.custom_model
+            || (is_ipa(&self.model)
+                && (self.text_dir != o.text_dir
+                    || self.text_model != o.text_model
+                    || self.ipa_ai != o.ipa_ai
+                    || self.custom_text != o.custom_text))
     }
+}
+
+/// Anything on disk from an earlier version means this is an existing install, not a first run.
+fn existing_install() -> bool {
+    let d = util::data_dir();
+    d.join("config.ini").exists() || d.join("engine").exists() || d.join("models").exists()
 }
 
 impl Config {
@@ -106,6 +134,13 @@ impl Config {
             model: "large-v3-turbo-q5_0".into(),
             lang: "auto".into(),
             desktop: false,
+            text_dir: util::data_dir().join("text-models"),
+            text_model: crate::llm::TEXT_MODELS[crate::llm::recommended_text()].id.into(),
+            ipa_ai: true,
+            custom_model: PathBuf::new(),
+            custom_text: PathBuf::new(),
+            // installs from before onboarding existed (and fresh updates of them) skip the wizard
+            onboarded: existing_install(),
         };
         if let Ok(t) = std::fs::read_to_string(Self::file()) {
             for l in t.lines() {
@@ -113,7 +148,13 @@ impl Config {
                     let v = v.trim();
                     match k.trim() {
                         "models_dir" if !v.is_empty() => c.models_dir = PathBuf::from(v),
-                        "model" if MODELS.iter().any(|m| m.0 == v) => c.model = v.into(),
+                        "model" if v == CUSTOM || MODELS.iter().any(|m| m.0 == v) => c.model = v.into(),
+                        "text_dir" if !v.is_empty() => c.text_dir = PathBuf::from(v),
+                        "text_model" if v == CUSTOM || crate::llm::TEXT_MODELS.iter().any(|m| m.id == v) => c.text_model = v.into(),
+                        "ipa_ai" => c.ipa_ai = v != "0",
+                        "custom_model" => c.custom_model = PathBuf::from(v),
+                        "custom_text" => c.custom_text = PathBuf::from(v),
+                        "onboarded" => c.onboarded = v == "1",
                         "lang" if !v.is_empty() => c.lang = v.into(),
                         "desktop" => c.desktop = v == "1",
                         _ => {}
@@ -127,16 +168,25 @@ impl Config {
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(util::data_dir());
         let t = format!(
-            "models_dir={}\nmodel={}\nlang={}\ndesktop={}\n",
+            "models_dir={}\nmodel={}\nlang={}\ndesktop={}\ntext_dir={}\ntext_model={}\nipa_ai={}\ncustom_model={}\ncustom_text={}\nonboarded={}\n",
             self.models_dir.display(),
             self.model,
             self.lang,
-            self.desktop as u8
+            self.desktop as u8,
+            self.text_dir.display(),
+            self.text_model,
+            self.ipa_ai as u8,
+            self.custom_model.display(),
+            self.custom_text.display(),
+            self.onboarded as u8
         );
         let _ = std::fs::write(Self::file(), t);
     }
 
     pub fn model_path(&self) -> PathBuf {
+        if self.model == CUSTOM {
+            return self.custom_model.clone();
+        }
         model_path_in(&self.models_dir, &self.model)
     }
 }
@@ -170,11 +220,11 @@ pub fn has_nvidia() -> bool {
     unsafe { !LoadLibraryA(b"nvcuda.dll\0".as_ptr()).is_null() }
 }
 
-fn stale(gen: u32) -> bool {
+pub(crate) fn stale(gen: u32) -> bool {
     GEN.load(Relaxed) != gen
 }
 
-fn dl(gen: u32, url: &str, dest: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn dl(gen: u32, url: &str, dest: &Path, label: &str) -> Result<(), String> {
     let mut last = -1i32;
     net::download(url, dest, &mut |done, total| {
         if total > 0 {
@@ -253,7 +303,7 @@ fn ensure_model(gen: u32, cfg: &Config) -> Result<PathBuf, String> {
 }
 
 // ---- server -----------------------------------------------------------------------------------
-fn job() -> isize {
+pub(crate) fn job() -> isize {
     use windows_sys::Win32::System::JobObjects::*;
     static JOB: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
     *JOB.get_or_init(|| unsafe {
@@ -274,6 +324,7 @@ fn job() -> isize {
 
 pub fn kill_server() {
     READY.store(false, Relaxed);
+    crate::llm::kill_server();
     if let Ok(mut g) = SERVER.lock() {
         if let Some(mut c) = g.take() {
             let _ = c.kill();
@@ -345,6 +396,7 @@ fn wait_ready(port: u16, gen: u32, crash_msg: &str) -> Result<(), String> {
 fn setup(cfg: &Config, gen: u32) -> Result<(), String> {
     setup_status(gen, "Starting…");
     IPA.store(is_ipa(&cfg.model), Relaxed);
+    IPA_AI.store(is_ipa(&cfg.model) && cfg.ipa_ai, Relaxed);
     if is_ipa(&cfg.model) {
         return setup_ipa(cfg, gen);
     }
@@ -455,7 +507,12 @@ fn whisper_form(samples: &[i16], boundary: &str) -> Vec<u8> {
 }
 
 fn send_request(path: &str, ctype: &str, body: &[u8], timeout: Duration) -> Result<String, String> {
-    let port = PORT.load(Relaxed);
+    let resp = http_post(PORT.load(Relaxed), path, ctype, body, timeout)?;
+    util::json_str(&resp, "text").ok_or_else(|| "engine error".to_string())
+}
+
+/// POST to a local engine; returns the raw response (headers + body) if the status was 200.
+pub(crate) fn http_post(port: u16, path: &str, ctype: &str, body: &[u8], timeout: Duration) -> Result<String, String> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|_| "engine not running".to_string())?;
     let _ = s.set_read_timeout(Some(timeout));
     let head = format!(
@@ -467,11 +524,11 @@ fn send_request(path: &str, ctype: &str, body: &[u8], timeout: Duration) -> Resu
         .map_err(|_| "engine not running".to_string())?;
     let mut resp = Vec::new();
     let _ = s.read_to_end(&mut resp);
-    let resp = String::from_utf8_lossy(&resp);
-    if !resp.starts_with("HTTP/1.1 200") {
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    if resp.split_whitespace().nth(1) != Some("200") {
         return Err("engine error".into());
     }
-    util::json_str(&resp, "text").ok_or_else(|| "engine error".to_string())
+    Ok(resp)
 }
 
 /// Collapses whitespace and drops Whisper's non-speech placeholders like "[BLANK_AUDIO]".
@@ -482,7 +539,12 @@ fn clean(t: &str) -> String {
 }
 
 pub fn transcribe(samples: &[i16]) -> Result<String, String> {
-    transcribe_raw(samples, Duration::from_secs(300)).map(|t| clean(&t))
+    let t = clean(&transcribe_raw(samples, Duration::from_secs(300))?);
+    if t.is_empty() || !IPA_AI.load(Relaxed) {
+        return Ok(t);
+    }
+    // IPA + AI: written text from the phones; if the text engine hiccups, the raw IPA is still better than nothing
+    Ok(crate::llm::format(&t).map(|f| clean(&f)).unwrap_or(t))
 }
 
 // ---- IPA (POWSM) --------------------------------------------------------------------------------
@@ -573,7 +635,7 @@ fn dir_size(p: &Path) -> u64 {
     n
 }
 
-fn unzip(zip: &Path, dest: &Path) -> bool {
+pub(crate) fn unzip(zip: &Path, dest: &Path) -> bool {
     let tar = std::env::var_os("SystemRoot")
         .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
         .unwrap_or_else(|| PathBuf::from("tar.exe"));
@@ -803,10 +865,27 @@ fn setup_ipa(cfg: &Config, gen: u32) -> Result<(), String> {
         install_ipa_runtime(gen)?;
     }
     let root = ensure_powsm(gen, cfg)?;
+    // optional text stage (Gemma): engine + model are only fetched with the same consent as the runtime
+    let text = if cfg.ipa_ai {
+        if !crate::llm::llama_ready() && !IPA_CONSENT.load(Relaxed) {
+            return Err("Text engine missing — pick IPA again in settings to download".into());
+        }
+        let exe = crate::llm::ensure_llama(gen)?;
+        let model = crate::llm::ensure_text_model(gen, cfg)?;
+        Some((exe, model))
+    } else {
+        None
+    };
     PROGRESS.store(-1, Relaxed);
     launch_ipa(&root, cfg, gen)?;
+    if let Some((exe, model)) = text {
+        crate::llm::launch(&exe, &model, gen)?;
+    }
     setup_status(gen, "Warming up GPU…");
     transcribe_raw(&vec![0i16; 16000], Duration::from_secs(900))?;
+    if IPA_AI.load(Relaxed) {
+        let _ = crate::llm::format("hɛloʊwɜːld"); // first request compiles/allocates; do it now
+    }
     if !stale(gen) {
         READY.store(true, Relaxed);
         setup_status(gen, "Ready (IPA) — click the mic");

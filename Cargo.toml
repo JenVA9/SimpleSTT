@@ -1,6 +1,6 @@
 [package]
 name = "simplestt"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Tiny click-to-dictate speech-to-text tray-less widget powered by whisper.cpp"
 license = "MIT"
@@ -27,9 +27,11 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_IO",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
