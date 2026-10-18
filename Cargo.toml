@@ -1,6 +1,6 @@
 [package]
 name = "simplestt"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "Tiny click-to-dictate speech-to-text tray-less widget powered by whisper.cpp"
 license = "MIT"
