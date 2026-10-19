@@ -35,8 +35,6 @@ const GX: f32 = 196.0;
 const GY: f32 = 22.0;
 const TX: f32 = 24.0; // desktop-audio toggle (top-left)
 const TY: f32 = 22.0;
-const DX: f32 = 196.0; // dev-mode toggle (right, middle)
-const DY: f32 = 62.0;
 const FX: f32 = 24.0; // "save this as wrong" flag (left, middle; dev mode only)
 const FY: f32 = 62.0;
 
@@ -280,20 +278,6 @@ fn toggle_desktop() {
     engine::set_status(if on { "Desktop audio on" } else { "Desktop audio off" }, false);
 }
 
-fn toggle_dev() {
-    let on = !DEV.load(Relaxed);
-    DEV.store(on, Relaxed);
-    let mut c = cfg();
-    c.dev = on;
-    c.save();
-    *CFG.lock().unwrap() = Some(c);
-    engine::set_status(
-        if on { "Dev mode on: the flag saves the last result as wrong" } else { "Dev mode off" },
-        false,
-    );
-    util::refresh();
-}
-
 /// "2026-10-19 14:05 UTC" from unix seconds (no date library needed).
 fn utc_stamp(secs: u64) -> String {
     let days = (secs / 86400) as i64;
@@ -326,7 +310,7 @@ fn save_flag() {
     let add = |name: &str, text: &str| {
         std::fs::OpenOptions::new().append(true).create(true).open(dir.join(name)).and_then(|mut f| f.write_all(text.as_bytes())).is_ok()
     };
-    let ok = add("dev-feedback.txt", &human);
+    let ok = add(&util::feedback_file().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), &human);
     engine::set_status(if ok { "Saved to dev-feedback.txt" } else { "Couldn't save the dev note" }, !ok);
 }
 
@@ -443,8 +427,6 @@ fn hit(x: i32, y: i32) -> u8 {
         2
     } else if d(TX, TY) <= sf(16.0).powi(2) {
         3
-    } else if d(DX, DY) <= sf(16.0).powi(2) {
-        4
     } else if DEV.load(Relaxed) && d(FX, FY) <= sf(16.0).powi(2) {
         5
     } else {
@@ -544,21 +526,11 @@ unsafe fn paint(hwnd: HWND) {
     // speaker = desktop audio included, muted speaker = mic only
     glyph(mem, F_GEAR.load(Relaxed), if desk { '\u{E767}' } else { '\u{E74F}' }, sf(TX), sf(TY), sf(16.0), tc);
 
-    // dev mode: "DEV" toggle on the right, flag on the left
-    let dev = DEV.load(Relaxed);
-    {
-        let old_f = SelectObject(mem, F_VER.load(Relaxed) as HFONT);
-        SetBkMode(mem, TRANSPARENT as i32);
-        SetTextColor(mem, if dev { ACCENT } else if hover == 4 { rgb(0xb0, 0xb0, 0xba) } else { rgb(0x56, 0x56, 0x62) });
-        let mut dr = RECT { left: s(DX as i32 - 16), top: s(DY as i32 - 8), right: s(DX as i32 + 16), bottom: s(DY as i32 + 8) };
-        let dt = w("DEV");
-        DrawTextW(mem, dt.as_ptr(), -1, &mut dr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(mem, old_f);
-        if dev {
-            let has = LAST.lock().map(|l| l.is_some()).unwrap_or(false);
-            let fc = if !has { rgb(0x56, 0x56, 0x62) } else if hover == 5 { rgb(255, 255, 255) } else { AMBER_TXT };
-            glyph(mem, F_GEAR.load(Relaxed), '\u{E7C1}', sf(FX), sf(FY), sf(16.0), fc);
-        }
+    // dev mode (switched on in settings): flag on the left saves the last result as wrong
+    if DEV.load(Relaxed) {
+        let has = LAST.lock().map(|l| l.is_some()).unwrap_or(false);
+        let fc = if !has { rgb(0x56, 0x56, 0x62) } else if hover == 5 { rgb(255, 255, 255) } else { AMBER_TXT };
+        glyph(mem, F_GEAR.load(Relaxed), '\u{E7C1}', sf(FX), sf(FY), sf(16.0), fc);
     }
 
     // status line
@@ -626,7 +598,6 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 1 => toggle_mic(),
                 2 => dialogs::open_settings(hwnd),
                 3 => toggle_desktop(),
-                4 => toggle_dev(),
                 5 => save_flag(),
                 _ => {}
             }
@@ -690,6 +661,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 pub(crate) fn apply_config(new: Config, restart: bool) {
     new.save();
     DESKTOP.store(new.desktop, Relaxed);
+    DEV.store(new.dev, Relaxed);
+    util::refresh();
     crate::llm::set_mode(new.ai_mode); // mode changes need no engine restart
     *CFG.lock().unwrap() = Some(new.clone());
     if !restart {

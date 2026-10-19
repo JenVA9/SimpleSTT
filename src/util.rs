@@ -37,6 +37,11 @@ pub fn from_wide(b: &[u16]) -> String {
 }
 
 /// Everything SimpleSTT installs lives here (no admin needed): %LOCALAPPDATA%\SimpleSTT
+/// Where dev mode collects its examples (one file, only ever cleared by the user).
+pub fn feedback_file() -> PathBuf {
+    data_dir().join("dev-feedback.txt")
+}
+
 pub fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)

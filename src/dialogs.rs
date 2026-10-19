@@ -285,6 +285,9 @@ const ID_TBROWSE: i32 = 106;
 const ID_DELETE: i32 = 107;
 const ID_TMODEL: i32 = 108;
 const ID_AI: i32 = 109; // the AI-mode combo
+const ID_DEV: i32 = 110; // dev-mode checkbox
+const ID_FB_OPEN: i32 = 111;
+const ID_FB_CLEAR: i32 = 112;
 
 fn sel_index(cb: HWND) -> usize {
     unsafe { SendMessageW(cb, CB_GETCURSEL, 0, 0).max(0) as usize }
@@ -376,7 +379,7 @@ pub unsafe fn open_settings(parent: HWND) {
     static REG: Once = Once::new();
     register(&util::class("SimpleSTTSettings"), Some(settings_proc), (COLOR_BTNFACE + 1) as HBRUSH, &REG);
     *DRAFT.lock().unwrap() = Some(cfg());
-    let h = create_dialog(parent, &util::class("SimpleSTTSettings"), "SimpleSTT settings", 460, 440);
+    let h = create_dialog(parent, &util::class("SimpleSTTSettings"), "SimpleSTT settings", 460, 520);
     SETTINGS.store(h as isize, Relaxed);
     // Non-modal: the main window stays usable. The settings window is *owned* by it, so it always stays
     // above the main window instead of disappearing behind it.
@@ -414,9 +417,13 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
             let dd = format!("Engines, caches and settings live in:\n{}", util::data_dir().display());
             ctl(hwnd, "STATIC", &dd, 0, 16, 342, 428, 36, 0);
-            ctl(hwnd, "BUTTON", "Delete all data…", BTN, 16, 394, 130, 30, ID_DELETE);
-            ctl(hwnd, "BUTTON", "Save", BTN | 1 /* BS_DEFPUSHBUTTON */, 274, 394, 80, 30, 1);
-            ctl(hwnd, "BUTTON", "Cancel", BTN, 364, 394, 80, 30, 2);
+            let dev = ctl(hwnd, "BUTTON", "Dev mode: flag button on the main window to save wrong results", BTN | 3 /* BS_AUTOCHECKBOX */, 16, 384, 428, 36, ID_DEV);
+            SendMessageW(dev, 0xF1 /* BM_SETCHECK */, c.dev as usize, 0);
+            ctl(hwnd, "BUTTON", "Open feedback file", BTN, 16, 426, 140, 28, ID_FB_OPEN);
+            ctl(hwnd, "BUTTON", "Clear feedback file", BTN, 164, 426, 140, 28, ID_FB_CLEAR);
+            ctl(hwnd, "BUTTON", "Delete all data…", BTN, 16, 474, 130, 30, ID_DELETE);
+            ctl(hwnd, "BUTTON", "Save", BTN | 1 /* BS_DEFPUSHBUTTON */, 274, 474, 80, 30, 1);
+            ctl(hwnd, "BUTTON", "Cancel", BTN, 364, 474, 80, 30, 2);
             0
         }
         WM_COMMAND => {
@@ -473,6 +480,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     new.lang = if lang.is_empty() { "auto".into() } else { lang };
                     new.ai_mode = AiMode::ALL[sel_index(dlg(ID_AI)).min(3)];
                     new.desktop = old.desktop; // toggled on the main window
+                    new.dev = SendMessageW(dlg(ID_DEV), 0xF0 /* BM_GETCHECK */, 0, 0) == 1;
                     new.onboarded = true;
                     // a custom entry without a file behaves like the previous choice
                     if new.model == CUSTOM && new.custom_model.as_os_str().is_empty() {
@@ -497,6 +505,23 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 }
                 2 => {
                     DestroyWindow(hwnd);
+                }
+                ID_FB_OPEN => {
+                    let f = util::feedback_file();
+                    if f.exists() {
+                        windows_sys::Win32::UI::Shell::ShellExecuteW(hwnd, w("open").as_ptr(), w(&f.to_string_lossy()).as_ptr(), null(), null(), SW_SHOW as i32);
+                    } else {
+                        MessageBoxW(hwnd, w("Nothing saved yet. With dev mode on, click the flag on the main window after a result that came out wrong.").as_ptr(), w("Feedback file").as_ptr(), MB_OK);
+                    }
+                }
+                ID_FB_CLEAR => {
+                    let f = util::feedback_file();
+                    if f.exists() {
+                        let ok = MessageBoxW(hwnd, w("Delete every saved example from the feedback file?").as_ptr(), w("Clear feedback file").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+                        if ok == IDYES {
+                            let _ = std::fs::remove_file(&f);
+                        }
+                    }
                 }
                 ID_DELETE => {
                     let text = w("This deletes the speech and text engines, the IPA runtime, every model SimpleSTT downloaded, and all settings, then closes SimpleSTT.\n\nModel files you picked yourself (custom) and SimpleSTT.exe are not touched — delete those yourself if you want.\n\nContinue?");
