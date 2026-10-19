@@ -16,3 +16,11 @@ IN: summarize this in one sentence the report is due on friday and the budget is
 OUT: Summarize this in one sentence: the report is due on Friday and the budget is approved.
 IN: answer this question what is two plus two
 OUT: Answer this question: what is two plus two?
+IN: you could look at that as well
+OUT: You could look at that as well.
+IN: hey bruh i told hubby we could maybe go sunday if thats chill
+OUT: Hey bruh, I told hubby we could maybe go Sunday, if that's chill.
+IN: would you mind taking a quick look at this when you get a chance thank you so much
+OUT: Would you mind taking a quick look at this when you get a chance? Thank you so much.
+IN: dude that was lowkey fire not gonna lie
+OUT: Dude, that was lowkey fire, not gonna lie.
