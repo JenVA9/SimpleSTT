@@ -429,6 +429,7 @@ fn setup(cfg: &Config, gen: u32) -> Result<(), String> {
     crate::llm::warm(); // first request allocates GPU buffers; do it now, not on the first dictation
     if !stale(gen) {
         READY.store(true, Relaxed);
+        std::thread::spawn(crate::live::recover_pending);
         setup_status(gen, "Ready — click the mic");
         util::refresh();
     }
@@ -912,6 +913,7 @@ fn setup_ipa(cfg: &Config, gen: u32) -> Result<(), String> {
     }
     if !stale(gen) {
         READY.store(true, Relaxed);
+        std::thread::spawn(crate::live::recover_pending);
         setup_status(gen, "Ready (IPA) — click the mic");
         util::refresh();
     }

@@ -101,6 +101,64 @@ fn save_unprocessed(audio: &[i16]) {
     let _ = std::fs::write(dir.join(format!("audio-{secs}-{n}.wav")), engine::wav(audio));
 }
 
+static RECOVERING: AtomicBool = AtomicBool::new(false);
+const KEEP_DAYS: u64 = 7;
+const KEEP_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Housekeeping for the "unprocessed" folder, run whenever the engine becomes ready: old/oversized files are
+/// deleted, and each remaining recording is transcribed again (only while you are not recording). Text that
+/// comes out is appended to the unprocessed folder in recovered.txt and the audio file is deleted, so nothing piles up.
+pub fn recover_pending() {
+    if RECOVERING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let dir = unprocessed_dir();
+    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "wav"))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    files.sort_by_key(|f| f.0);
+    let now = std::time::SystemTime::now();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    files.retain(|(t, len, path)| {
+        let old = now.duration_since(*t).map(|d| d.as_secs() > KEEP_DAYS * 86400).unwrap_or(false);
+        if old || total > KEEP_BYTES {
+            let _ = std::fs::remove_file(path);
+            total = total.saturating_sub(*len);
+            false
+        } else {
+            true
+        }
+    });
+    for (_, _, path) in files {
+        let st = engine::STATE.load(Ordering::Relaxed);
+        if !(st == engine::IDLE || st == engine::DONE) || !engine::READY.load(Ordering::Relaxed) {
+            break; // busy or engine gone: try again next time it becomes ready
+        }
+        let Ok(b) = std::fs::read(&path) else { continue };
+        let samples: Vec<i16> = b.get(44..).unwrap_or(&[]).chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        match engine::transcribe(&samples) {
+            Ok(t) => {
+                if !t.is_empty() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(dir.join("recovered.txt")) {
+                        let _ = writeln!(f, "{t}");
+                    }
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(_) => break,
+        }
+    }
+    RECOVERING.store(false, Ordering::Release);
+}
+
 /// Transcribes one phrase. If the engine fails for good, the audio is written to disk and the recording goes
 /// on, so one bad moment never throws away what was said.
 fn send(
