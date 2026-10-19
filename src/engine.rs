@@ -468,7 +468,7 @@ pub fn test_set_port(p: u16) {
 }
 
 // ---- transcription ----------------------------------------------------------------------------
-fn wav(samples: &[i16]) -> Vec<u8> {
+pub(crate) fn wav(samples: &[i16]) -> Vec<u8> {
     let data = (samples.len() * 2) as u32;
     let mut v = Vec::with_capacity(44 + data as usize);
     v.extend_from_slice(b"RIFF");

@@ -80,6 +80,29 @@ impl Live {
     }
 }
 
+/// Chunks the engine could not transcribe even after restarting (their audio was saved to disk instead).
+pub static LOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LAST_ERR: Mutex<String> = Mutex::new(String::new());
+
+pub fn last_error() -> String {
+    LAST_ERR.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// Folder where audio is kept when the engine failed on it.
+pub fn unprocessed_dir() -> std::path::PathBuf {
+    crate::util::data_dir().join("unprocessed")
+}
+
+fn save_unprocessed(audio: &[i16]) {
+    let dir = unprocessed_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let n = LOST.load(Ordering::Relaxed);
+    let _ = std::fs::write(dir.join(format!("audio-{secs}-{n}.wav")), engine::wav(audio));
+}
+
+/// Transcribes one phrase. If the engine fails for good, the audio is written to disk and the recording goes
+/// on, so one bad moment never throws away what was said.
 fn send(
     live: &Live,
     from: usize,
@@ -88,13 +111,24 @@ fn send(
     on_text: &dyn Fn(&str),
     text: &mut String,
 ) -> Result<(), String> {
-    let t = transcribe(&live.mixed(from, to))?;
-    if !t.is_empty() {
-        if !text.is_empty() {
-            text.push(' ');
+    let audio = live.mixed(from, to);
+    match transcribe(&audio) {
+        Ok(t) => {
+            if !t.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&t);
+                on_text(&t);
+            }
         }
-        text.push_str(&t);
-        on_text(&t);
+        Err(e) => {
+            save_unprocessed(&audio);
+            LOST.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut g) = LAST_ERR.lock() {
+                *g = e;
+            }
+        }
     }
     Ok(())
 }

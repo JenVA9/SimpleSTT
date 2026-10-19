@@ -222,20 +222,39 @@ fn live_file() -> PathBuf {
     util::data_dir().join("live-transcript.txt")
 }
 
-/// Waits for the engine (recording may start before it's ready), then transcribes one chunk.
+/// Waits for the engine (recording may start before it's ready), then transcribes one chunk. If the engine
+/// dies or fails, the chunk's audio is kept right here, the engine is restarted and the same audio is sent
+/// again (twice at most before the caller saves it to disk).
 fn transcribe_chunk(a: &[i16]) -> Result<String, String> {
     let mut announced = false;
-    while !engine::READY.load(Relaxed) {
-        if engine::FAILED.load(Relaxed) {
-            return Err(engine::status());
+    let mut restarts = 0;
+    loop {
+        while !engine::READY.load(Relaxed) {
+            if engine::FAILED.load(Relaxed) {
+                if restarts >= 2 {
+                    return Err(engine::status());
+                }
+                restarts += 1;
+                engine::set_status("Engine failed — restarting, your audio is kept…", true);
+                engine::start_setup(cfg());
+            } else if !announced && STATE.load(Relaxed) == TRANS {
+                announced = true;
+                engine::set_status("Waiting for model…", false);
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if !announced && STATE.load(Relaxed) == TRANS {
-            announced = true;
-            engine::set_status("Waiting for model…", false);
+        match engine::transcribe(a) {
+            Err(e) if e == "engine not running" || e == "engine error" => {
+                if restarts >= 2 {
+                    return Err(e);
+                }
+                restarts += 1;
+                engine::set_status("Engine stopped — restarting, your audio is kept…", true);
+                engine::start_setup(cfg());
+            }
+            other => return other,
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
-    engine::transcribe(a)
 }
 
 fn toggle_desktop() {
@@ -254,6 +273,7 @@ fn toggle_desktop() {
 
 fn start_rec() {
     crate::llm::acc_reset();
+    live::LOST.store(0, Relaxed);
     REC_STOP.store(false, Release);
     let (tx, rx) = mpsc::channel();
     let desktop = cfg().desktop;
@@ -304,7 +324,11 @@ fn stop_rec() {
         let res = match job {
             Some((rec, chunker)) => {
                 let _ = rec.join();
-                chunker.join().unwrap_or_else(|_| Err("transcription crashed".into()))
+                let r = chunker.join().unwrap_or_else(|_| Err("transcription crashed".into()));
+                match r {
+                    Ok(t) if t.is_empty() && live::LOST.load(Relaxed) > 0 => Err(lost_msg()),
+                    other => other,
+                }
             }
             None => Ok(String::new()),
         };
@@ -315,6 +339,14 @@ fn stop_rec() {
         };
         finish(res);
     });
+}
+
+fn lost_msg() -> String {
+    format!(
+        "Engine failed ({}) — your audio was saved in {}",
+        live::last_error(),
+        live::unprocessed_dir().display()
+    )
 }
 
 fn finish(res: Result<String, String>) {
@@ -540,7 +572,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if util::set_clipboard(hwnd, &t) {
                     let _ = std::fs::remove_file(live_file()); // temp transcript no longer needed
                     STATE.store(DONE, Relaxed);
-                    engine::set_status("Copied to clipboard", false);
+                    if live::LOST.load(Relaxed) > 0 {
+                        engine::set_status("Copied, but part of the audio failed — saved in the SimpleSTT/unprocessed folder", true);
+                    } else {
+                        engine::set_status("Copied to clipboard", false);
+                    }
                 } else {
                     idle("Couldn't access the clipboard", true);
                 }
