@@ -35,6 +35,10 @@ const GX: f32 = 196.0;
 const GY: f32 = 22.0;
 const TX: f32 = 24.0; // desktop-audio toggle (top-left)
 const TY: f32 = 22.0;
+const DX: f32 = 196.0; // dev-mode toggle (right, middle)
+const DY: f32 = 62.0;
+const FX: f32 = 24.0; // "save this as wrong" flag (left, middle; dev mode only)
+const FY: f32 = 62.0;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -44,6 +48,7 @@ const GRAY_H: u32 = rgb(0x4a, 0x4a, 0x57);
 const RED: u32 = rgb(0xe5, 0x48, 0x4d);
 const AMBER: u32 = rgb(0xf5, 0xa5, 0x24);
 const GREEN: u32 = rgb(0x30, 0xa4, 0x6c);
+const AMBER_TXT: u32 = rgb(0xf5, 0xa5, 0x24);
 const ACCENT: u32 = rgb(0x3b, 0xa3, 0xff);
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -62,6 +67,9 @@ static F_MIC: AtomicIsize = AtomicIsize::new(0);
 static F_GEAR: AtomicIsize = AtomicIsize::new(0);
 static F_VER: AtomicIsize = AtomicIsize::new(0);
 static DESKTOP: AtomicBool = AtomicBool::new(false);
+static DEV: AtomicBool = AtomicBool::new(false);
+/// (raw speech-engine text, final output, ai mode, model) of the most recent dictation
+static LAST: Mutex<Option<(String, String, String, String)>> = Mutex::new(None);
 static T0: OnceLock<Instant> = OnceLock::new();
 static RESULT: Mutex<Option<String>> = Mutex::new(None);
 static CFG: Mutex<Option<Config>> = Mutex::new(None);
@@ -110,6 +118,7 @@ pub fn run() {
             c.save();
         }
         DESKTOP.store(c.desktop, Relaxed);
+        DEV.store(c.dev, Relaxed);
         crate::llm::set_mode(c.ai_mode);
         *CFG.lock().unwrap() = Some(c);
 
@@ -271,9 +280,62 @@ fn toggle_desktop() {
     engine::set_status(if on { "Desktop audio on" } else { "Desktop audio off" }, false);
 }
 
+fn toggle_dev() {
+    let on = !DEV.load(Relaxed);
+    DEV.store(on, Relaxed);
+    let mut c = cfg();
+    c.dev = on;
+    c.save();
+    *CFG.lock().unwrap() = Some(c);
+    engine::set_status(
+        if on { "Dev mode on: the flag saves the last result as wrong" } else { "Dev mode off" },
+        false,
+    );
+    util::refresh();
+}
+
+/// "2026-10-19 14:05 UTC" from unix seconds (no date library needed).
+fn utc_stamp(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, rem % 3600 / 60)
+}
+
+/// Dev mode: appends the last dictation (what the speech engine heard + the final output) to
+/// the single file dev-feedback.txt in the data folder (never cleaned up automatically), so wrong results can be reviewed later.
+fn save_flag() {
+    let Some((raw, out, mode, model)) = LAST.lock().ok().and_then(|l| l.clone()) else {
+        engine::set_status("Nothing to save yet: dictate something first", true);
+        return;
+    };
+    use std::io::Write;
+    let dir = util::data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let when = utc_stamp(secs);
+    let human = format!("=== {when} | model {model} | AI {mode}\nRAW:    {raw}\nOUTPUT: {out}\n\n");
+    let add = |name: &str, text: &str| {
+        std::fs::OpenOptions::new().append(true).create(true).open(dir.join(name)).and_then(|mut f| f.write_all(text.as_bytes())).is_ok()
+    };
+    let ok = add("dev-feedback.txt", &human);
+    engine::set_status(if ok { "Saved to dev-feedback.txt" } else { "Couldn't save the dev note" }, !ok);
+}
+
 fn start_rec() {
     crate::llm::acc_reset();
     live::LOST.store(0, Relaxed);
+    if let Ok(mut g) = engine::RAW_PARTS.lock() {
+        g.clear();
+    }
     REC_STOP.store(false, Release);
     let (tx, rx) = mpsc::channel();
     let desktop = cfg().desktop;
@@ -352,6 +414,9 @@ fn lost_msg() -> String {
 fn finish(res: Result<String, String>) {
     match res {
         Ok(t) if !t.is_empty() => {
+            let raw = engine::RAW_PARTS.lock().map(|g| g.join(" ")).unwrap_or_default();
+            let c = cfg();
+            *LAST.lock().unwrap() = Some((raw, t.clone(), c.ai_mode.id().to_string(), c.model.clone()));
             *RESULT.lock().unwrap() = Some(t);
             unsafe { PostMessageW(util::main_hwnd(), WM_RESULT, 0, 0) };
         }
@@ -378,6 +443,10 @@ fn hit(x: i32, y: i32) -> u8 {
         2
     } else if d(TX, TY) <= sf(16.0).powi(2) {
         3
+    } else if d(DX, DY) <= sf(16.0).powi(2) {
+        4
+    } else if DEV.load(Relaxed) && d(FX, FY) <= sf(16.0).powi(2) {
+        5
     } else {
         0
     }
@@ -475,6 +544,23 @@ unsafe fn paint(hwnd: HWND) {
     // speaker = desktop audio included, muted speaker = mic only
     glyph(mem, F_GEAR.load(Relaxed), if desk { '\u{E767}' } else { '\u{E74F}' }, sf(TX), sf(TY), sf(16.0), tc);
 
+    // dev mode: "DEV" toggle on the right, flag on the left
+    let dev = DEV.load(Relaxed);
+    {
+        let old_f = SelectObject(mem, F_VER.load(Relaxed) as HFONT);
+        SetBkMode(mem, TRANSPARENT as i32);
+        SetTextColor(mem, if dev { ACCENT } else if hover == 4 { rgb(0xb0, 0xb0, 0xba) } else { rgb(0x56, 0x56, 0x62) });
+        let mut dr = RECT { left: s(DX as i32 - 16), top: s(DY as i32 - 8), right: s(DX as i32 + 16), bottom: s(DY as i32 + 8) };
+        let dt = w("DEV");
+        DrawTextW(mem, dt.as_ptr(), -1, &mut dr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(mem, old_f);
+        if dev {
+            let has = LAST.lock().map(|l| l.is_some()).unwrap_or(false);
+            let fc = if !has { rgb(0x56, 0x56, 0x62) } else if hover == 5 { rgb(255, 255, 255) } else { AMBER_TXT };
+            glyph(mem, F_GEAR.load(Relaxed), '\u{E7C1}', sf(FX), sf(FY), sf(16.0), fc);
+        }
+    }
+
     // status line
     let old_f = SelectObject(mem, F_TEXT.load(Relaxed) as HFONT);
     SetBkMode(mem, TRANSPARENT as i32);
@@ -540,6 +626,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 1 => toggle_mic(),
                 2 => dialogs::open_settings(hwnd),
                 3 => toggle_desktop(),
+                4 => toggle_dev(),
+                5 => save_flag(),
                 _ => {}
             }
             0

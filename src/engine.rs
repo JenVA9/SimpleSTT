@@ -99,6 +99,8 @@ pub struct Config {
     pub custom_text: PathBuf,
     /// false until the first-run wizard has been completed (never shown to existing installs)
     pub onboarded: bool,
+    /// dev mode: the main window gets a button that saves the last raw transcript + final output for review
+    pub dev: bool,
 }
 
 impl Config {
@@ -139,6 +141,7 @@ impl Config {
             custom_text: PathBuf::new(),
             // installs from before onboarding existed (and fresh updates of them) skip the wizard
             onboarded: existing_install(),
+            dev: false,
         };
         let (mut ai_set, mut legacy_ipa_ai) = (false, true);
         if let Ok(t) = std::fs::read_to_string(Self::file()) {
@@ -160,6 +163,7 @@ impl Config {
                         "custom_model" => c.custom_model = PathBuf::from(v),
                         "custom_text" => c.custom_text = PathBuf::from(v),
                         "onboarded" => c.onboarded = v == "1",
+                        "dev" => c.dev = v == "1",
                         "lang" if !v.is_empty() => c.lang = v.into(),
                         "desktop" => c.desktop = v == "1",
                         _ => {}
@@ -177,7 +181,7 @@ impl Config {
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(util::data_dir());
         let t = format!(
-            "models_dir={}\nmodel={}\nlang={}\ndesktop={}\ntext_dir={}\ntext_model={}\nai_mode={}\ncustom_model={}\ncustom_text={}\nonboarded={}\n",
+            "models_dir={}\nmodel={}\nlang={}\ndesktop={}\ntext_dir={}\ntext_model={}\nai_mode={}\ncustom_model={}\ncustom_text={}\nonboarded={}\ndev={}\n",
             self.models_dir.display(),
             self.model,
             self.lang,
@@ -187,7 +191,8 @@ impl Config {
             self.ai_mode.id(),
             self.custom_model.display(),
             self.custom_text.display(),
-            self.onboarded as u8
+            self.onboarded as u8,
+            self.dev as u8
         );
         let _ = std::fs::write(Self::file(), t);
     }
@@ -557,8 +562,16 @@ fn clean(t: &str) -> String {
     if blank { String::new() } else { t }
 }
 
+/// What the speech engine heard (before any text-AI step) for the current recording; used by dev mode.
+pub static RAW_PARTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 pub fn transcribe(samples: &[i16]) -> Result<String, String> {
     let t = clean(&transcribe_raw(samples, Duration::from_secs(300))?);
+    if !t.is_empty() {
+        if let Ok(mut g) = RAW_PARTS.lock() {
+            g.push(t.clone());
+        }
+    }
     let mode = crate::llm::mode();
     if t.is_empty() || mode == AiMode::Off {
         return Ok(t);
